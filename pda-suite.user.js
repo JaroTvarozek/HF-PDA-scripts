@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PDA Suite (HF Slovakia)
 // @namespace    http://tampermonkey.net/
-// @version      1.3.0
+// @version      1.4.0
 // @description  Vsetky vylepsenia PDA v jednom skripte + panel na zapinanie a vypinanie jednotlivych modulov
 // @author       Gabris, Tvarozek
 // @updateURL    https://github.com/JaroTvarozek/HF-PDA-scripts/raw/refs/heads/main/pda-suite.user.js
@@ -1639,12 +1639,15 @@
 #${OVERVIEW_ID} .ov-tools input, #${OVERVIEW_ID} .ov-tools select {
   padding:6px 10px; border:1px solid #ccd4e0; border-radius:7px; font:inherit; font-size:.85rem; }
 #${OVERVIEW_ID} .ov-tools input { width:190px; }
-#${OVERVIEW_ID} .ov-chips { display:grid; grid-template-columns:repeat(auto-fill,minmax(168px,1fr)); gap:7px; }
-#${OVERVIEW_ID} .ov-chip { display:flex; align-items:center; justify-content:space-between; gap:8px;
-  border:1px solid #dfe4ec; border-radius:9px; background:#fff; padding:9px 11px; cursor:pointer;
+#${OVERVIEW_ID} .ov-chips { display:grid; grid-template-columns:repeat(auto-fill,minmax(215px,1fr)); gap:7px; }
+#${OVERVIEW_ID} .ov-chip { display:flex; align-items:center; justify-content:space-between; gap:10px;
+  border:1px solid #dfe4ec; border-radius:9px; background:#fff; padding:8px 11px; cursor:pointer;
   font:inherit; text-align:left; transition:border-color .12s, background .12s; }
 #${OVERVIEW_ID} .ov-chip:hover { border-color:#5b8def; background:#f6f9ff; }
 #${OVERVIEW_ID} .ov-chip b { font-size:.93rem; }
+#${OVERVIEW_ID} .ov-txt { display:flex; flex-direction:column; min-width:0; }
+#${OVERVIEW_ID} .ov-txt small { font-size:.71rem; color:#6b7180; line-height:1.3;
+  white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 #${OVERVIEW_ID} .ov-st { display:flex; align-items:center; gap:5px; font-size:.76rem; color:#6b7180; white-space:nowrap; }
 #${OVERVIEW_ID} .ov-dot { width:7px; height:7px; border-radius:50%; background:#9fb4d4; flex-shrink:0; }
 #${OVERVIEW_ID} .ov-chip.run .ov-dot { background:#2f9e44; }
@@ -1827,10 +1830,21 @@
                             const chip = document.createElement('button');
                             chip.type = 'button';
                             chip.className = 'ov-chip' + (it.online > 0 ? ' run' : '');
-                            chip.title = it.name;
+                            chip.title = (it.code ? it.code + ' — ' : '') + it.name;
+
+                            const txt = document.createElement('span');
+                            txt.className = 'ov-txt';
 
                             const label = document.createElement('b');
                             label.textContent = it.code || it.name;
+                            txt.appendChild(label);
+
+                            // druhy riadok: nazov pracoviska, skrateny
+                            if (it.code && it.name) {
+                                const sub = document.createElement('small');
+                                sub.textContent = it.name.length > 20 ? it.name.slice(0, 20).trim() + '…' : it.name;
+                                txt.appendChild(sub);
+                            }
 
                             const st = document.createElement('span');
                             st.className = 'ov-st';
@@ -1841,7 +1855,7 @@
                                 it.onlineKnown ? (it.online > 0 ? 'Výroba' : 'Nevýroba') : 'Otvoriť'
                             ));
 
-                            chip.appendChild(label);
+                            chip.appendChild(txt);
                             chip.appendChild(st);
                             chip.addEventListener('click', () => pressElement(it.tile));
                             chips.appendChild(chip);
@@ -1863,6 +1877,19 @@
             });
         }
 
+        /*
+         * Najde najblizsieho spolocneho rodica vsetkych dlazdic.
+         * Kazda dlazdica ma vlastny obal (bunka UI5 mriezky), takze skryt
+         * tiles[0].parentElement by skrylo iba jednu dlazdicu - treba ist
+         * vyssie, az k celej mriezke.
+         */
+        function commonAncestor(nodes) {
+            if (nodes.length === 0) return null;
+            let anc = nodes[0].parentElement;
+            while (anc && !nodes.every((n) => anc.contains(n))) anc = anc.parentElement;
+            return anc;
+        }
+
         function ensureOverview() {
             // len na uvodnej obrazovke
             if (!document.getElementById(HOME_BUTTON_ID)) return;
@@ -1870,13 +1897,16 @@
             const tiles = Array.from(document.querySelectorAll(TILE_SELECTOR));
             if (tiles.length === 0) return;
 
-            const grid = tiles[0].parentElement;
-            if (!grid) return;
+            const grid = commonAncestor(tiles);
+            if (!grid || !grid.parentElement) return;
 
             let host = document.getElementById(OVERVIEW_ID);
-            if (!host) {
+            if (!host || !host.parentElement) {
                 host = document.createElement('div');
                 host.id = OVERVIEW_ID;
+            }
+            // host musi byt SUROdenec mriezky, inak by ho skrytie schovalo tiez
+            if (host.nextElementSibling !== grid || host.parentElement !== grid.parentElement) {
                 grid.parentElement.insertBefore(host, grid);
             }
 
