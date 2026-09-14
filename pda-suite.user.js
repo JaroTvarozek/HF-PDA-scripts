@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PDA Suite (HF Slovakia)
 // @namespace    http://tampermonkey.net/
-// @version      1.2.0
+// @version      1.3.0
 // @description  Vsetky vylepsenia PDA v jednom skripte + panel na zapinanie a vypinanie jednotlivych modulov
 // @author       Gabris, Tvarozek
 // @updateURL    https://github.com/JaroTvarozek/HF-PDA-scripts/raw/refs/heads/main/pda-suite.user.js
@@ -52,6 +52,7 @@
     const KEY_USERS = 'pda_users_v1';
     const KEY_PDM = 'pda_pdm_v1';
     const KEY_EXCEL = 'pda_excel_v1';
+    const KEY_GROUPS = 'pda_groups_v1';
 
     function loadJson(key, fallback) {
         try {
@@ -78,6 +79,13 @@
         pdm: loadJson(KEY_PDM, { base: 'http://172.16.77.134:9000', key: '' }),
         // url prazdna = subor sa vybera rucne cez tlacidlo "Vybrať Excel"
         excel: loadJson(KEY_EXCEL, { url: '', colOrder: 'H', colDrawing: 'AH', colVersion: 'AI' }),
+        // kategorie pracovisk pre uvodny prehlad: Nazov|Podtitul|VZOR,VZOR,...
+        groups: loadJson(KEY_GROUPS, [
+            'Assembly|Finálna montáž a podzostavy|MONTAZ,ASSEMBLY,PODZOST,MONT',
+            'Welding|Zváranie a príprava|ZVAR,TIG,MIG,WELD',
+            'Machining|CNC a konvenčné obrábanie|CNC,FREZ,SUSTR,BRUS,LMS,HMS,K-TEC,VRTA,PILA,HOBL,HEDELL',
+            'Quality Control|Kontrola a meranie|OTK,KONTROL,MERAN,QC,KVALIT',
+        ].join('\n')),
     };
 
     // "H" -> 7, "AH" -> 33 (vracia 0-based index stlpca ako ho vidi XLSX)
@@ -1108,14 +1116,29 @@
 
         // --- Excel ---
 
+        /*
+         * Cislo vyrobnej zakazky sa v Exceli a v PDA nepise rovnako:
+         *   PDA:   001600089585
+         *   Excel: '1600089585   (apostrof = textova bunka, bez uvodnych nul)
+         * Povodny skript to riesil tak, ze natvrdo odrezal prve dva znaky a
+         * pridal apostrof - staci mala zmena formatu v Exceli a nenajde nic.
+         * Preto sa obe strany prevedu na rovnaky tvar: bez apostrofu, bez
+         * medzier a bez uvodnych nul.
+         */
+        function normalizeOrderKey(value) {
+            return String(value === undefined || value === null ? '' : value)
+                .trim()
+                .replace(/^'+/, '')
+                .replace(/\s+/g, '')
+                .replace(/^0+/, '');
+        }
+
         function buildDrawingIndex(rows) {
             const index = {};
             for (let i = 1; i < rows.length; i++) {
                 const row = rows[i];
                 if (!row) continue;
-                const orderNoRaw = row[COL_ORDER_NO];
-                if (orderNoRaw === undefined || orderNoRaw === null || orderNoRaw === '') continue;
-                const key = String(orderNoRaw).trim();
+                const key = normalizeOrderKey(row[COL_ORDER_NO]);
                 if (!key) continue;
                 index[key] = {
                     drawingNo: row[COL_DRAWING_NO] != null ? String(row[COL_DRAWING_NO]).trim() : '',
@@ -1242,6 +1265,7 @@
                 workcenter: op.workcenterDescription,
                 workcenterCode: op.workcenter,
                 productionOrderNo: op.productionOrderNo,
+                salesOrderNo: op.salesOrderNo,
                 operationNo: op.operationNo,
                 sequenceNo: op.sequenceNo,
                 materialNo: op.materialNo,
@@ -1255,36 +1279,108 @@
             return value.charAt(0) === "'" ? value.slice(1) : value;
         }
 
-        function applyForOperation(current) {
-            // kluc v exceli je textovy: apostrof + cislo zakazky bez prvych dvoch znakov
-            const lookupKey = "'" + (current.productionOrderNo || '').slice(2);
-            updateDisplay(drawingIndex[lookupKey] || null);
+        function salesOrderOf(current) {
+            return String((current && current.salesOrderNo) || '').trim();
         }
 
-        function updateDisplay(drawing) {
+        // "3-55.2-06.74-075_001_A_0.pdf" -> "3-55.2-06.74-075"
+        function drawingNoFromResult(v) {
+            if (v.cislo_vykresu) return v.cislo_vykresu;
+            if (v.kluc && v.kluc_typ === 'vykres') return v.kluc;
+            return String(v.nazov || '').replace(/\.(pdf|tiff?)$/i, '').split('_')[0];
+        }
+
+        // Ked sluzba vrati viac suborov, najrelevantnejsi je ten, ktory lezi
+        // v priecinku tejto zakazky a ktoremu sedi revizia so SAP verziou.
+        function bestResult(list) {
+            return list.find((v) => v.v_zakazke && v.zhoda_revizie === true) ||
+                   list.find((v) => v.v_zakazke) ||
+                   list.find((v) => v.zhoda_revizie === true) ||
+                   list[0] || null;
+        }
+
+        let lookupToken = 0;
+
+        /*
+         * Cislo vykresu sa zistuje v dvoch krokoch:
+         *   1. z Excelu podla cisla vyrobnej zakazky (ak je Excel nacitany)
+         *   2. inak priamo zo sluzby vykresov podla cisla materialu, ktore
+         *      PDA uz pozna - Excel teda nie je podmienkou
+         * Zakaznicka zakazka ide do parametra "path", vdaka comu sluzba oznaci
+         * vykresy lezice priamo v tejto zakazke (v_zakazke = true).
+         */
+        async function applyForOperation(current) {
+            const token = ++lookupToken;
+
+            const fromExcel = drawingIndex[normalizeOrderKey(current.productionOrderNo)];
+            const excelDrawingNo = fromExcel ? stripLeadingApostrophe(fromExcel.drawingNo) : '';
+            if (excelDrawingNo) {
+                updateDisplay({
+                    drawingNo: excelDrawingNo,
+                    version: stripLeadingApostrophe(fromExcel.version) || '',
+                    searchTerm: excelDrawingNo,
+                    source: 'excel',
+                });
+                return;
+            }
+
+            const material = String(current.materialNo || '').trim();
+            if (!material) { updateDisplay(null); return; }
+
+            updateDisplay({ drawingNo: '…', version: '', searchTerm: material, source: 'hladam' });
+
+            try {
+                const d = await pdmSearch(material, { path: salesOrderOf(current) });
+                if (token !== lookupToken) return; // medzitym sa otvorila ina operacia
+
+                const best = bestResult(d.vysledky || []);
+                if (!best) { updateDisplay(null); return; }
+
+                updateDisplay({
+                    drawingNo: drawingNoFromResult(best),
+                    version: best.revizia || '',
+                    searchTerm: material,
+                    source: 'pdm',
+                    count: d.pocet || 0,
+                });
+            } catch (e) {
+                if (token !== lookupToken) return;
+                console.warn(LOG, 'hľadanie výkresu zlyhalo', e);
+                updateDisplay(null);
+            }
+        }
+
+        function updateDisplay(info) {
             const valueEl = document.getElementById('__pda_order_drawing_value__');
             const revisionEl = document.getElementById('__pda_order_drawing_revision__');
             if (!valueEl || !revisionEl) return;
 
-            if (!drawing) {
+            if (!info) {
                 currentDrawingInfo = null;
                 valueEl.textContent = '—';
                 revisionEl.textContent = '';
                 return;
             }
 
-            const cleanDrawingNo = stripLeadingApostrophe(drawing.drawingNo) || '—';
-            const cleanVersion = stripLeadingApostrophe(drawing.version) || '';
-            currentDrawingInfo = { drawingNo: cleanDrawingNo, version: cleanVersion };
-            valueEl.textContent = cleanDrawingNo;
-            revisionEl.textContent = cleanVersion ? 'rev. ' + cleanVersion : '';
+            currentDrawingInfo = info;
+            valueEl.textContent = info.drawingNo || '—';
+
+            if (info.source === 'hladam') {
+                revisionEl.textContent = 'hľadám…';
+            } else if (info.version) {
+                revisionEl.textContent = 'rev. ' + info.version + (info.count > 1 ? ' · ' + info.count + ' súb.' : '');
+            } else {
+                revisionEl.textContent = info.count > 1 ? info.count + ' súbory' : '';
+            }
         }
 
         // --- sluzba "Mapa vykresov" (PDM) ---
 
-        function pdmSearch(cislo) {
+        function pdmSearch(cislo, { path = '', live = false } = {}) {
             return new Promise((resolve, reject) => {
                 const params = new URLSearchParams({ q: cislo });
+                if (path) params.set('path', path);
+                if (live) params.set('live', '1');
                 GM_xmlhttpRequest({
                     method: 'GET',
                     url: settings.pdm.base + '/search?' + params,
@@ -1303,7 +1399,7 @@
             });
         }
 
-        function pdmOpenDialog(cislo) {
+        function pdmOpenDialog(cislo, { path = '' } = {}) {
             const overlay = document.createElement('div');
             overlay.id = '__pda_pdm_overlay__';
             overlay.style.cssText =
@@ -1327,36 +1423,61 @@
 
             const telo = overlay.querySelector('[data-pda-telo]');
 
-            pdmSearch(cislo).then((d) => {
-                if (!d.pocet) {
-                    telo.innerHTML = '<p>Pre <b>' + cislo + '</b> sa nenašiel žiadny PDF ani TIFF výkres.</p>';
-                    return;
-                }
-                telo.innerHTML =
-                    '<table style="width:100%;border-collapse:collapse;font-size:14px"><thead><tr>' +
-                    '<th style="text-align:left;padding:6px;border-bottom:2px solid #5b9bd5">Názov</th>' +
-                    '<th style="text-align:left;padding:6px;border-bottom:2px solid #5b9bd5">Revízia</th>' +
-                    '<th style="text-align:left;padding:6px;border-bottom:2px solid #5b9bd5">Stav</th>' +
-                    '<th style="text-align:left;padding:6px;border-bottom:2px solid #5b9bd5">Ver.</th>' +
-                    '</tr></thead><tbody>' +
-                    d.vysledky.map((v) =>
-                        '<tr data-id="' + v.id + '" style="cursor:pointer;background:' + (v.zhoda_revizie === true ? '#e6f4ea' : 'transparent') + '">' +
-                        '<td style="padding:6px;border-bottom:1px solid #eee"><b>' + v.nazov + '</b></td>' +
-                        '<td style="padding:6px;border-bottom:1px solid #eee">' + (v.revizia || '') + '</td>' +
-                        '<td style="padding:6px;border-bottom:1px solid #eee">' + (v.stav || '') + '</td>' +
-                        '<td style="padding:6px;border-bottom:1px solid #eee">' + (v.verzia != null ? v.verzia : '') + '</td>' +
-                        '</tr>').join('') +
-                    '</tbody></table>' +
-                    '<p style="color:#777;font-size:12px;margin-top:10px">' + d.pocet + ' výkresov · ' +
-                    (d.zdroj === 'mapa' ? 'z dennej mapy' : 'naživo z PDM') +
-                    (d.mapa_z ? ' (' + d.mapa_z + ')' : '') + ' · kliknutím sa výkres otvorí</p>';
+            const TH = 'style="text-align:left;padding:6px;border-bottom:2px solid #5b9bd5"';
+            const TD = 'style="padding:6px;border-bottom:1px solid #eee"';
 
-                telo.querySelectorAll('tr[data-id]').forEach((tr) => {
-                    tr.addEventListener('click', () => W.open(settings.pdm.base + '/file/' + tr.dataset.id, '_blank'));
+            function run(live) {
+                telo.innerHTML = live
+                    ? '<p>Hľadám naživo v PDM… (môže to trvať pár sekúnd)</p>'
+                    : '<p>Hľadám…</p>';
+
+                pdmSearch(cislo, { path, live }).then((d) => {
+                    if (!d.pocet) {
+                        telo.innerHTML =
+                            '<p>Pre <b>' + cislo + '</b> sa nenašiel žiadny PDF ani TIFF výkres.</p>' +
+                            (live ? '' :
+                                '<p style="color:#777;font-size:12px">Denná mapa sa obnovuje raz za deň — čerstvo pridaný výkres v nej ešte nemusí byť.</p>' +
+                                '<button data-pda-live type="button" style="background:#5b9bd5;color:#fff;border:0;border-radius:7px;padding:8px 15px;cursor:pointer;font:inherit;font-size:.88rem">Hľadať naživo v PDM</button>');
+                        const liveBtn = telo.querySelector('[data-pda-live]');
+                        if (liveBtn) liveBtn.addEventListener('click', () => run(true));
+                        return;
+                    }
+
+                    telo.innerHTML =
+                        '<table style="width:100%;border-collapse:collapse;font-size:14px"><thead><tr>' +
+                        '<th ' + TH + '>Názov</th><th ' + TH + '>Revízia</th>' +
+                        '<th ' + TH + '>Stav</th><th ' + TH + '>Ver.</th>' +
+                        '</tr></thead><tbody>' +
+                        d.vysledky.map((v) => {
+                            const bg = v.zhoda_revizie === true ? '#e6f4ea' : (v.v_zakazke ? '#f3f7fd' : 'transparent');
+                            const mark = v.v_zakazke ? ' <span style="font-size:10px;color:#2f6fbf;border:1px solid #b9cbe8;border-radius:9px;padding:1px 6px">v zákazke</span>' : '';
+                            return '<tr data-id="' + v.id + '" style="cursor:pointer;background:' + bg + '">' +
+                                '<td ' + TD + '><b>' + v.nazov + '</b>' + mark + '</td>' +
+                                '<td ' + TD + '>' + (v.revizia || '') + '</td>' +
+                                '<td ' + TD + '>' + (v.stav || '') + '</td>' +
+                                '<td ' + TD + '>' + (v.verzia != null ? v.verzia : '') + '</td></tr>';
+                        }).join('') +
+                        '</tbody></table>' +
+                        '<p data-pda-info style="color:#777;font-size:12px;margin-top:10px">' + d.pocet + ' výkresov · ' +
+                        (d.zdroj === 'mapa' ? 'z dennej mapy' : 'naživo z PDM') +
+                        (d.mapa_z ? ' (' + d.mapa_z + ')' : '') +
+                        ' · zelený riadok = revízia sedí so SAP · kliknutím sa výkres otvorí</p>';
+
+                    telo.querySelectorAll('tr[data-id]').forEach((tr) => {
+                        tr.addEventListener('click', () => {
+                            const info = telo.querySelector('[data-pda-info]');
+                            // vydaj suboru trva 0,4-4 s, treba to dat najavo
+                            if (info) info.textContent = 'Otváram výkres… (ťahá sa z PDM, môže to chvíľu trvať)';
+                            W.open(settings.pdm.base + '/file/' + tr.dataset.id, '_blank');
+                        });
+                    });
+                }).catch((err) => {
+                    telo.innerHTML = '<p style="color:#b00">Služba výkresov neodpovedala.<br>' + err.message +
+                        '<br><span style="color:#777;font-size:12px">Adresa: ' + settings.pdm.base + '</span></p>';
                 });
-            }).catch((err) => {
-                telo.innerHTML = '<p style="color:#b00">Služba výkresov neodpovedala.<br>' + err.message + '</p>';
-            });
+            }
+
+            run(false);
         }
 
         // --- tlacidla ---
@@ -1371,7 +1492,8 @@
                 error: ['Chyba, skús znova', '#fdecea', '#e53935'],
                 'url-error': ['Excel sa nestiahol — skús znova', '#fdecea', '#e53935'],
                 unsupported: ['Prehliadač nepodporuje zapamätanie', '#fdecea', '#e53935'],
-                nofile: ['Vybrať Excel', '#f5f5f5', '#ccc'],
+                // Excel uz nie je podmienkou - vykres sa najde aj podla materialu
+                nofile: ['Excel (nepovinné)', '#f5f5f5', '#ccc'],
             };
             const [text, bg, border] = states[state] || states.nofile;
             loadButton.textContent = text;
@@ -1423,8 +1545,17 @@
             button.appendChild(value);
             button.appendChild(revision);
             button.addEventListener('click', () => {
-                if (currentDrawingInfo && currentDrawingInfo.drawingNo) pdmOpenDialog(currentDrawingInfo.drawingNo);
-                else console.log(LOG, 'pre aktuálnu zákazku nie je známy žiadny výkres');
+                const path = salesOrderOf(shared.currentOperation);
+
+                // ak uz vieme cislo vykresu (alebo aspon material), hladame podla neho
+                if (currentDrawingInfo && currentDrawingInfo.searchTerm) {
+                    pdmOpenDialog(currentDrawingInfo.searchTerm, { path });
+                    return;
+                }
+                // inak skusime aspon cislo materialu z otvorenej operacie
+                const material = shared.currentOperation && String(shared.currentOperation.materialNo || '').trim();
+                if (material) pdmOpenDialog(material, { path });
+                else console.log(LOG, 'pre aktuálnu zákazku nie je známe ani číslo výkresu, ani materiálu');
             });
 
             wrapper.appendChild(loadButton);
@@ -1451,7 +1582,319 @@
         });
     }
 
-    /* --------------------- 3.8 Ladiaci vypis ---------------------------- */
+    /* ------------------ 3.8 Prehlad pracovisk (uvodna) ------------------ */
+
+    function modWorkcenterOverview() {
+        const TILE_SELECTOR = '[id^="Main--Workcenter_Toolbar-Main--ui_layout_Grid3-"]';
+        const TILE_ID_PREFIX = 'Main--Workcenter_Toolbar-';
+        const HOME_BUTTON_ID = 'Main--Button_HomeScreen';
+        const OVERVIEW_ID = '__pda_overview__';
+        const STYLE_ID = '__pda_overview_styles__';
+
+        const expanded = new Set();   // nazvy rozbalenych kategorii
+        const filters = {};           // hladanie a filter pre kazdu kategoriu
+        let lastSignature = null;
+        let wcByName = {};            // popis pracoviska -> { code }
+
+        // kod pracoviska sa da spolahlivo vytiahnut z odpovede servera
+        XhrBus.subscribe((ev) => {
+            if (!ev.request || ev.request.BOMethod !== 'getOperationListTempForWorkcenters') return;
+            const list = ev.response && ev.response.result && ev.response.result.aOperationListTempForWorkcenter;
+            if (!list) return;
+            const map = {};
+            list.forEach((wc) => {
+                if (wc.workcenterDescription) map[wc.workcenterDescription] = { code: wc.workcenter };
+            });
+            wcByName = map;
+            lastSignature = null; // vynuti prekreslenie s doplnenymi kodmi
+        });
+
+        function injectStyles() {
+            if (document.getElementById(STYLE_ID)) return;
+            const st = document.createElement('style');
+            st.id = STYLE_ID;
+            st.textContent = `
+#${OVERVIEW_ID} { font: 14px/1.5 -apple-system,"Segoe UI",Roboto,sans-serif; color:#1a2233; padding: 4px 0 10px; }
+#${OVERVIEW_ID} .ov-hi { padding: 4px 6px 14px; }
+#${OVERVIEW_ID} .ov-hi .k { font-size:.68rem; letter-spacing:.12em; color:#5b7cb5; font-weight:700; }
+#${OVERVIEW_ID} .ov-hi .n { font-size:1.7rem; font-weight:700; margin:2px 0 1px; }
+#${OVERVIEW_ID} .ov-hi .s { color:#6b7180; font-size:.87rem; }
+#${OVERVIEW_ID} .ov-g { border:1px solid #dfe4ec; border-radius:12px; background:#fff; margin-bottom:10px; overflow:hidden; }
+#${OVERVIEW_ID} .ov-g.open { border-color:#b9cbe8; box-shadow:0 1px 6px rgba(40,70,130,.08); }
+#${OVERVIEW_ID} .ov-gh { display:flex; align-items:center; gap:14px; width:100%; background:none; border:0;
+  padding:14px 16px; cursor:pointer; text-align:left; font:inherit; color:inherit; }
+#${OVERVIEW_ID} .ov-g.open .ov-gh { background:#f2f6fc; }
+#${OVERVIEW_ID} .ov-ic { width:42px; height:42px; border-radius:9px; background:#eaf1fb; flex-shrink:0;
+  display:flex; align-items:center; justify-content:center; font-size:21px; }
+#${OVERVIEW_ID} .ov-gt { flex:1 1 auto; min-width:0; }
+#${OVERVIEW_ID} .ov-gt b { font-size:1.05rem; display:block; }
+#${OVERVIEW_ID} .ov-gt span { color:#6b7180; font-size:.85rem; }
+#${OVERVIEW_ID} .ov-num { text-align:center; flex-shrink:0; min-width:74px; }
+#${OVERVIEW_ID} .ov-num b { display:block; font-size:1.3rem; color:#1d4ed8; line-height:1.1; }
+#${OVERVIEW_ID} .ov-num span { font-size:.62rem; letter-spacing:.09em; color:#8b93a3; }
+#${OVERVIEW_ID} .ov-num.on b { color:#2f7d43; }
+#${OVERVIEW_ID} .ov-ch { color:#9aa3b4; font-size:18px; flex-shrink:0; }
+#${OVERVIEW_ID} .ov-gb { padding:4px 16px 16px; border-top:1px solid #e8edf4; }
+#${OVERVIEW_ID} .ov-tools { display:flex; gap:8px; justify-content:flex-end; margin:12px 0; flex-wrap:wrap; }
+#${OVERVIEW_ID} .ov-tools input, #${OVERVIEW_ID} .ov-tools select {
+  padding:6px 10px; border:1px solid #ccd4e0; border-radius:7px; font:inherit; font-size:.85rem; }
+#${OVERVIEW_ID} .ov-tools input { width:190px; }
+#${OVERVIEW_ID} .ov-chips { display:grid; grid-template-columns:repeat(auto-fill,minmax(168px,1fr)); gap:7px; }
+#${OVERVIEW_ID} .ov-chip { display:flex; align-items:center; justify-content:space-between; gap:8px;
+  border:1px solid #dfe4ec; border-radius:9px; background:#fff; padding:9px 11px; cursor:pointer;
+  font:inherit; text-align:left; transition:border-color .12s, background .12s; }
+#${OVERVIEW_ID} .ov-chip:hover { border-color:#5b8def; background:#f6f9ff; }
+#${OVERVIEW_ID} .ov-chip b { font-size:.93rem; }
+#${OVERVIEW_ID} .ov-st { display:flex; align-items:center; gap:5px; font-size:.76rem; color:#6b7180; white-space:nowrap; }
+#${OVERVIEW_ID} .ov-dot { width:7px; height:7px; border-radius:50%; background:#9fb4d4; flex-shrink:0; }
+#${OVERVIEW_ID} .ov-chip.run .ov-dot { background:#2f9e44; }
+#${OVERVIEW_ID} .ov-chip.run .ov-st { color:#2f7d43; font-weight:600; }
+#${OVERVIEW_ID} .ov-empty { color:#8b93a3; font-size:.85rem; padding:8px 2px; }
+`;
+            document.head.appendChild(st);
+        }
+
+        function normalize(s) {
+            // bez diakritiky a velkymi pismenami, aby "ZVÁR" naslo aj "ZVAR"
+            return String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toUpperCase();
+        }
+
+        function parseGroups() {
+            return String(settings.groups || '')
+                .split('\n')
+                .map((line) => line.trim())
+                .filter(Boolean)
+                .map((line) => {
+                    const parts = line.split('|');
+                    return {
+                        name: (parts[0] || '').trim(),
+                        subtitle: (parts[1] || '').trim(),
+                        patterns: (parts[2] || '').split(',').map((p) => normalize(p.trim())).filter(Boolean),
+                    };
+                })
+                .filter((g) => g.name);
+        }
+
+        function getTileName(tile) {
+            const suffix = tile.id.replace(TILE_ID_PREFIX, '');
+            const el = document.getElementById('Main--WorkcenterDescription_Label-' + suffix + '-bdi');
+            return el ? el.textContent.trim() : '';
+        }
+
+        // Pocet prihlasenych ludi na pracovisku. Hlada kratke cislo v hlavicke
+        // dlazdice - teda mimo zoznamu operacii, ktory ma vlastne pocty.
+        function readOnlineCount(tile) {
+            const suffix = tile.id.replace(TILE_ID_PREFIX, '');
+            const descEl = document.getElementById('Main--WorkcenterDescription_Label-' + suffix + '-bdi');
+            const opList = tile.querySelector('[id^="Main--List2-"]');
+
+            const candidates = Array.from(tile.querySelectorAll('bdi'));
+            let seenDesc = !descEl;
+            for (const el of candidates) {
+                if (el === descEl) { seenDesc = true; continue; }
+                if (!seenDesc) continue;
+                if (opList && opList.contains(el)) break; // dalej uz je zoznam operacii
+                const txt = (el.textContent || '').trim();
+                if (/^\d{1,3}$/.test(txt)) return parseInt(txt, 10);
+            }
+            return null;
+        }
+
+        function collectTiles() {
+            return Array.from(document.querySelectorAll(TILE_SELECTOR)).map((tile) => {
+                const name = getTileName(tile);
+                const online = readOnlineCount(tile);
+                const known = wcByName[name];
+                return {
+                    tile,
+                    name,
+                    code: known ? known.code : '',
+                    online: online === null ? 0 : online,
+                    onlineKnown: online !== null,
+                };
+            }).filter((t) => t.name);
+        }
+
+        function groupOf(entry, groups) {
+            const hay = normalize(entry.code + ' ' + entry.name);
+            for (const g of groups) {
+                if (g.patterns.some((p) => hay.indexOf(p) !== -1)) return g.name;
+            }
+            return 'Ostatné';
+        }
+
+        function buildGroups(entries) {
+            const defs = parseGroups();
+            const buckets = new Map();
+            defs.forEach((g) => buckets.set(g.name, { def: g, items: [] }));
+
+            entries.forEach((e) => {
+                const name = groupOf(e, defs);
+                if (!buckets.has(name)) {
+                    buckets.set(name, { def: { name, subtitle: 'Nezaradené pracoviská', patterns: [] }, items: [] });
+                }
+                buckets.get(name).items.push(e);
+            });
+
+            return Array.from(buckets.values()).filter((b) => b.items.length > 0);
+        }
+
+        const ICONS = {
+            'Assembly': '🔧', 'Welding': '🔥', 'Machining': '⚙',
+            'Quality Control': '🔎', 'Ostatné': '📦',
+        };
+
+        function render(host, entries) {
+            host.innerHTML = '';
+            injectStyles();
+
+            const userEl = document.querySelector('[id$="Label_Username-bdi"]');
+            const hi = document.createElement('div');
+            hi.className = 'ov-hi';
+            hi.innerHTML =
+                '<div class="k">VITAJTE SPÄŤ</div>' +
+                '<div class="n"></div>' +
+                '<div class="s">Vyberte pracovisko a začnite pracovať.</div>';
+            hi.querySelector('.n').textContent = userEl ? userEl.textContent.trim() : 'Pracoviská';
+            host.appendChild(hi);
+
+            buildGroups(entries).forEach((bucket) => {
+                const gName = bucket.def.name;
+                const isOpen = expanded.has(gName);
+                const onlineCount = bucket.items.filter((i) => i.online > 0).length;
+
+                const box = document.createElement('div');
+                box.className = 'ov-g' + (isOpen ? ' open' : '');
+
+                const head = document.createElement('button');
+                head.type = 'button';
+                head.className = 'ov-gh';
+                head.innerHTML =
+                    '<div class="ov-ic">' + (ICONS[gName] || '📦') + '</div>' +
+                    '<div class="ov-gt"><b></b><span></span></div>' +
+                    '<div class="ov-num"><b>' + bucket.items.length + '</b><span>PRACOVÍSK</span></div>' +
+                    '<div class="ov-num on"><b>' + onlineCount + '</b><span>ONLINE</span></div>' +
+                    '<div class="ov-ch">' + (isOpen ? '⌄' : '›') + '</div>';
+                head.querySelector('.ov-gt b').textContent = gName;
+                head.querySelector('.ov-gt span').textContent = bucket.def.subtitle || '';
+                head.addEventListener('click', () => {
+                    if (expanded.has(gName)) expanded.delete(gName);
+                    else expanded.add(gName);
+                    lastSignature = null;
+                    render(host, collectTiles());
+                });
+                box.appendChild(head);
+
+                if (isOpen) {
+                    const body = document.createElement('div');
+                    body.className = 'ov-gb';
+
+                    const state = filters[gName] || (filters[gName] = { q: '', only: 'all' });
+
+                    const tools = document.createElement('div');
+                    tools.className = 'ov-tools';
+
+                    const q = document.createElement('input');
+                    q.type = 'search';
+                    q.placeholder = 'Hľadať pracovisko…';
+                    q.value = state.q;
+
+                    const sel = document.createElement('select');
+                    sel.innerHTML = '<option value="all">Všetky</option><option value="run">Iba vo výrobe</option>';
+                    sel.value = state.only;
+
+                    const chips = document.createElement('div');
+                    chips.className = 'ov-chips';
+
+                    function paintChips() {
+                        chips.innerHTML = '';
+                        const needle = normalize(state.q);
+                        const shown = bucket.items.filter((it) => {
+                            if (state.only === 'run' && !(it.online > 0)) return false;
+                            if (!needle) return true;
+                            return normalize(it.code + ' ' + it.name).indexOf(needle) !== -1;
+                        });
+
+                        if (shown.length === 0) {
+                            const empty = document.createElement('div');
+                            empty.className = 'ov-empty';
+                            empty.textContent = 'Nič nezodpovedá zadaniu.';
+                            chips.appendChild(empty);
+                            return;
+                        }
+
+                        shown.forEach((it) => {
+                            const chip = document.createElement('button');
+                            chip.type = 'button';
+                            chip.className = 'ov-chip' + (it.online > 0 ? ' run' : '');
+                            chip.title = it.name;
+
+                            const label = document.createElement('b');
+                            label.textContent = it.code || it.name;
+
+                            const st = document.createElement('span');
+                            st.className = 'ov-st';
+                            const dot = document.createElement('span');
+                            dot.className = 'ov-dot';
+                            st.appendChild(dot);
+                            st.appendChild(document.createTextNode(
+                                it.onlineKnown ? (it.online > 0 ? 'Výroba' : 'Nevýroba') : 'Otvoriť'
+                            ));
+
+                            chip.appendChild(label);
+                            chip.appendChild(st);
+                            chip.addEventListener('click', () => pressElement(it.tile));
+                            chips.appendChild(chip);
+                        });
+                    }
+
+                    q.addEventListener('input', () => { state.q = q.value; paintChips(); });
+                    sel.addEventListener('change', () => { state.only = sel.value; paintChips(); });
+
+                    tools.appendChild(q);
+                    tools.appendChild(sel);
+                    body.appendChild(tools);
+                    body.appendChild(chips);
+                    box.appendChild(body);
+                    paintChips();
+                }
+
+                host.appendChild(box);
+            });
+        }
+
+        function ensureOverview() {
+            // len na uvodnej obrazovke
+            if (!document.getElementById(HOME_BUTTON_ID)) return;
+
+            const tiles = Array.from(document.querySelectorAll(TILE_SELECTOR));
+            if (tiles.length === 0) return;
+
+            const grid = tiles[0].parentElement;
+            if (!grid) return;
+
+            let host = document.getElementById(OVERVIEW_ID);
+            if (!host) {
+                host = document.createElement('div');
+                host.id = OVERVIEW_ID;
+                grid.parentElement.insertBefore(host, grid);
+            }
+
+            // povodna mriezka sa skryje, ale zostava v DOM - klika sa cez nu
+            if (grid.style.display !== 'none') grid.style.display = 'none';
+
+            const entries = collectTiles();
+            const signature = entries.map((e) => e.name + ':' + e.code + ':' + e.online).join('|');
+            if (signature === lastSignature) return;
+            lastSignature = signature;
+
+            render(host, entries);
+        }
+
+        DomWatch.add(ensureOverview);
+    }
+
+    /* --------------------- 3.9 Ladiaci vypis ---------------------------- */
 
     function modDebugLog() {
         XhrBus.subscribe((ev) => {
@@ -1519,6 +1962,13 @@
             def: false,
             needs: 'Firemná sieť',
             run: modDrawingButton,
+        },
+        {
+            id: 'overview',
+            name: 'Prehľad pracovísk na úvode',
+            desc: 'Zbalí úvodnú obrazovku do kategórií (Assembly, Welding, Machining…). Vidíš len čísla strojov a či pracujú; klik otvorí stroj.',
+            def: true,
+            run: modWorkcenterOverview,
         },
         {
             id: 'debug',
@@ -1618,6 +2068,7 @@
         const draftUsers = settings.users.map((u) => ({ ...u }));
         const draftPdm = { ...settings.pdm };
         const draftExcel = { ...settings.excel };
+        const draftGroups = { value: String(settings.groups || '') };
 
         const overlay = document.createElement('div');
         overlay.id = OVERLAY_ID;
@@ -1898,8 +2349,30 @@
 
         const colNote = document.createElement('p');
         colNote.className = 'pda-note';
-        colNote.textContent = 'Písmená stĺpcov tak, ako ich vidíš v Exceli. Predvolene H, AH a AI.';
+        colNote.textContent = 'Písmená stĺpcov tak, ako ich vidíš v Exceli. Predvolene H, AH a AI. ' +
+            'Excel je nepovinný — ak chýba, výkres sa hľadá priamo podľa čísla materiálu.';
         body.appendChild(colNote);
+
+        // --- kategorie pracovisk pre uvodny prehlad ---
+        const hGroups = document.createElement('h3');
+        hGroups.textContent = 'Kategórie pracovísk (úvodná obrazovka)';
+        body.appendChild(hGroups);
+
+        const groupsTa = document.createElement('textarea');
+        groupsTa.rows = 5;
+        groupsTa.spellcheck = false;
+        groupsTa.value = draftGroups.value;
+        groupsTa.style.cssText = 'width:100%;box-sizing:border-box;padding:8px 10px;border:1px solid #ccd1d9;' +
+            'border-radius:6px;font:12px/1.5 ui-monospace,Consolas,monospace;resize:vertical;';
+        groupsTa.addEventListener('input', () => { draftGroups.value = groupsTa.value; });
+        body.appendChild(groupsTa);
+
+        const groupsNote = document.createElement('p');
+        groupsNote.className = 'pda-note';
+        groupsNote.textContent = 'Jedna kategória na riadok: Názov|Podtitul|VZOR,VZOR,… ' +
+            'Pracovisko padne do prvej kategórie, ktorej vzor sa nachádza v jeho čísle alebo názve ' +
+            '(bez ohľadu na diakritiku a veľkosť písmen). Čo sa nikam nehodí, skončí v „Ostatné" — nič sa nestratí.';
+        body.appendChild(groupsNote);
 
         // --- paticka ---
         const foot = document.createElement('div');
@@ -1940,6 +2413,7 @@
             saveJson(KEY_USERS, draftUsers.filter((u) => u.username));
             saveJson(KEY_PDM, draftPdm);
             saveJson(KEY_EXCEL, draftExcel);
+            saveJson(KEY_GROUPS, draftGroups.value);
             close();
             shared.intentionalReload = true;
             location.reload();
