@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PDA Suite (HF Slovakia)
 // @namespace    http://tampermonkey.net/
-// @version      1.6.0
+// @version      1.7.0
 // @description  Vsetky vylepsenia PDA v jednom skripte + panel na zapinanie a vypinanie jednotlivych modulov
 // @author       Gabris, Tvarozek
 // @updateURL    https://github.com/JaroTvarozek/HF-PDA-scripts/raw/refs/heads/main/pda-suite.user.js
@@ -1385,7 +1385,29 @@
                 return;
             }
 
-            // material: najprv z Excelu (ak zakazku pozna, ale vykres tam nema), inak z operacie
+            updateDisplay({ drawingNo: '…', version: '', searchTerm: '', source: 'hladam' });
+
+            // 2) sluzba vykresov pozna denny export -> kluc priamo pre tuto vyrobnu zakazku
+            try {
+                const z = await pdmOrderLookup(current.productionOrderNo);
+                if (token !== lookupToken) return;
+                if (z && z.kluc) {
+                    const isDrawing = z.typ !== 'material';
+                    updateDisplay({
+                        drawingNo: isDrawing ? z.kluc : 'SAP ' + z.kluc,
+                        version: isDrawing ? (z.revizia || '') : '',
+                        searchTerm: z.kluc,
+                        source: 'server',
+                        count: z.pocet || 0,
+                    });
+                    return;
+                }
+            } catch (e) {
+                if (token !== lookupToken) return;
+                console.log(LOG, 'služba nepozná zákazku (alebo ešte nemá /zakazka), skúšam materiál:', e.message);
+            }
+
+            // 3) zaloha: material - najprv z Excelu (ak zakazku pozna, ale vykres tam nema), inak z operacie
             const material = ((fromExcel && fromExcel.materialNo) || String(current.materialNo || '')).trim();
             if (!material) { updateDisplay(null); return; }
 
@@ -1437,6 +1459,32 @@
         }
 
         // --- sluzba "Mapa vykresov" (PDM) ---
+
+        /*
+         * Vyrobna zakazka -> kluc z denneho exportu. Sluzba vykresov cita AutomatedOQ180.xlsx
+         * raz denne a ku kazdemu vykresu drzi zoznam zakaziek; endpoint /zakazka/<cislo>
+         * to vrati jednym dopytom. 404 = zakazka v exporte nie je.
+         */
+        function pdmOrderLookup(productionOrderNo) {
+            const cislo = normalizeOrderKey(productionOrderNo);
+            if (!cislo) return Promise.resolve(null);
+            return new Promise((resolve, reject) => {
+                GM_xmlhttpRequest({
+                    method: 'GET',
+                    url: settings.pdm.base + '/zakazka/' + encodeURIComponent(cislo),
+                    headers: settings.pdm.key ? { 'X-API-Key': settings.pdm.key } : {},
+                    timeout: 15000,
+                    onload: (r) => {
+                        if (r.status === 404) { resolve(null); return; }
+                        if (r.status < 200 || r.status >= 300) { reject(new Error('HTTP ' + r.status)); return; }
+                        try { resolve(JSON.parse(r.responseText)); }
+                        catch (e) { reject(new Error('neplatná odpoveď služby')); }
+                    },
+                    onerror: () => reject(new Error('spojenie so službou zlyhalo')),
+                    ontimeout: () => reject(new Error('služba neodpovedala včas')),
+                });
+            });
+        }
 
         function pdmSearch(cislo, { path = '', live = false } = {}) {
             return new Promise((resolve, reject) => {
@@ -1576,6 +1624,7 @@
                 'needs-permission': ['Povoliť prístup k Excelu', '#fff4e5', '#f9a825'],
                 error: ['Chyba, skús znova', '#fdecea', '#e53935'],
                 'url-error': ['Excel sa nestiahol — skús znova', '#fdecea', '#e53935'],
+                'url-invalid': ['Adresa Excelu nie je http — klik otvorí nastavenia', '#fff4e5', '#f9a825'],
                 unsupported: ['Prehliadač nepodporuje zapamätanie', '#fdecea', '#e53935'],
                 // Excel uz nie je podmienkou - vykres sa najde aj podla materialu
                 nofile: ['Excel (nepovinné)', '#f5f5f5', '#ccc'],
@@ -1603,7 +1652,9 @@
             loadButton.type = 'button';
             loadButton.style.cssText = 'padding:6px 10px;border:1px solid #ccc;border-radius:6px;background:#f5f5f5;cursor:pointer;font-size:0.75rem;margin-right:8px;align-self:center;';
             loadButton.addEventListener('click', () => {
-                if (settings.excel.url) loadExcelFromUrl(settings.excel.url);
+                const url = String(settings.excel.url || '').trim();
+                if (url && !/^https?:\/\//i.test(url)) openSettings();
+                else if (url) loadExcelFromUrl(url);
                 else if (pendingHandle) confirmPermissionAndLoad(pendingHandle);
                 else pickFileAndRemember();
             });
@@ -1636,7 +1687,8 @@
                 if (currentDrawingInfo && currentDrawingInfo.searchTerm) {
                     pdmOpenDialog(currentDrawingInfo.searchTerm, {
                         path,
-                        rev: currentDrawingInfo.source === 'excel' ? currentDrawingInfo.version : '',
+                        rev: (currentDrawingInfo.source === 'excel' || currentDrawingInfo.source === 'server')
+                            ? currentDrawingInfo.version : '',
                     });
                     return;
                 }
@@ -1665,8 +1717,16 @@
         onReady(() => {
             // ak je v nastaveniach adresa, tahame odtial automaticky;
             // inak sa subor vybera rucne a prehliadac si ho pamata
-            if (settings.excel.url) loadExcelFromUrl(settings.excel.url);
-            else tryAutoLoad();
+            const url = String(settings.excel.url || '').trim();
+            if (url && !/^https?:\/\//i.test(url)) {
+                // cesta na disk (C:\... alebo \\server\...) nie je adresa - prehliadac ju neotvori
+                console.warn(LOG, 'adresa Excelu nie je http(s), ignorujem:', url);
+                updateLoadButtonState('url-invalid');
+            } else if (url) {
+                loadExcelFromUrl(url);
+            } else {
+                tryAutoLoad();
+            }
         });
     }
 
