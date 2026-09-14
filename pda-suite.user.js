@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PDA Suite (HF Slovakia)
 // @namespace    http://tampermonkey.net/
-// @version      1.1.0
+// @version      1.2.0
 // @description  Vsetky vylepsenia PDA v jednom skripte + panel na zapinanie a vypinanie jednotlivych modulov
 // @author       Gabris, Tvarozek
 // @updateURL    https://github.com/JaroTvarozek/HF-PDA-scripts/raw/refs/heads/main/pda-suite.user.js
@@ -51,6 +51,7 @@
     const KEY_MODULES = 'pda_modules_v1';
     const KEY_USERS = 'pda_users_v1';
     const KEY_PDM = 'pda_pdm_v1';
+    const KEY_EXCEL = 'pda_excel_v1';
 
     function loadJson(key, fallback) {
         try {
@@ -75,7 +76,18 @@
         modules: loadJson(KEY_MODULES, {}),
         users: loadJson(KEY_USERS, []),
         pdm: loadJson(KEY_PDM, { base: 'http://172.16.77.134:9000', key: '' }),
+        // url prazdna = subor sa vybera rucne cez tlacidlo "Vybrať Excel"
+        excel: loadJson(KEY_EXCEL, { url: '', colOrder: 'H', colDrawing: 'AH', colVersion: 'AI' }),
     };
+
+    // "H" -> 7, "AH" -> 33 (vracia 0-based index stlpca ako ho vidi XLSX)
+    function colToIndex(letters, fallbackIndex) {
+        const s = String(letters || '').trim().toUpperCase();
+        if (!/^[A-Z]{1,3}$/.test(s)) return fallbackIndex;
+        let n = 0;
+        for (const ch of s) n = n * 26 + (ch.charCodeAt(0) - 64);
+        return n - 1;
+    }
 
     function isModuleOn(mod) {
         const stored = settings.modules[mod.id];
@@ -1045,9 +1057,10 @@
         const STORE_NAME = 'handles';
         const HANDLE_KEY = 'excel_file_handle';
 
-        const COL_ORDER_NO = 7;    // stlpec H
-        const COL_DRAWING_NO = 33; // stlpec AH
-        const COL_VERSION = 34;    // stlpec AI
+        // stlpce sa daju prestavit v nastaveniach (predvolene H, AH, AI)
+        const COL_ORDER_NO = colToIndex(settings.excel.colOrder, 7);
+        const COL_DRAWING_NO = colToIndex(settings.excel.colDrawing, 33);
+        const COL_VERSION = colToIndex(settings.excel.colVersion, 34);
 
         const CONTAINER_ID = 'WorkcenterDetail--Order_FlexBox';
         const WRAPPER_ID = '__pda_order_drawing_wrapper__';
@@ -1112,18 +1125,55 @@
             return index;
         }
 
-        async function loadExcelFromFile(file) {
-            const buffer = await file.arrayBuffer();
-            const workbook = XLSX.read(new Uint8Array(buffer), { type: 'array' });
+        function parseWorkbook(bytes) {
+            const workbook = XLSX.read(bytes, { type: 'array' });
             const sheet = workbook.Sheets[workbook.SheetNames[0]];
             if (!sheet) {
                 console.warn(LOG, 'v exceli sa nenašiel žiadny list');
-                return;
+                return false;
             }
             drawingIndex = buildDrawingIndex(XLSX.utils.sheet_to_json(sheet, { header: 1 }));
             console.log(LOG, 'index výkresov vytvorený, záznamov:', Object.keys(drawingIndex).length);
             updateLoadButtonState('loaded');
             if (shared.currentOperation) applyForOperation(shared.currentOperation);
+            return true;
+        }
+
+        async function loadExcelFromFile(file) {
+            parseWorkbook(new Uint8Array(await file.arrayBuffer()));
+        }
+
+        // Excel stiahnuty z adresy (http://...). GM_xmlhttpRequest obchadza CORS,
+        // takze sa da siahnut aj na interny server.
+        function fetchExcel(url) {
+            return new Promise((resolve, reject) => {
+                GM_xmlhttpRequest({
+                    method: 'GET',
+                    url,
+                    responseType: 'arraybuffer',
+                    onload: (r) => {
+                        if (r.status < 200 || r.status >= 300) {
+                            reject(new Error('HTTP ' + r.status));
+                            return;
+                        }
+                        resolve(r.response);
+                    },
+                    onerror: () => reject(new Error('spojenie so serverom zlyhalo')),
+                    ontimeout: () => reject(new Error('server neodpovedal včas')),
+                });
+            });
+        }
+
+        async function loadExcelFromUrl(url) {
+            updateLoadButtonState('loading');
+            try {
+                const buffer = await fetchExcel(url);
+                if (!buffer) throw new Error('prázdna odpoveď');
+                parseWorkbook(new Uint8Array(buffer));
+            } catch (e) {
+                console.warn(LOG, 'Excel sa nepodarilo stiahnuť z adresy', url, e);
+                updateLoadButtonState('url-error');
+            }
         }
 
         async function pickFileAndRemember() {
@@ -1319,6 +1369,7 @@
                 loading: ['Načítavam…', '#f5f5f5', '#ccc'],
                 'needs-permission': ['Povoliť prístup k Excelu', '#fff4e5', '#f9a825'],
                 error: ['Chyba, skús znova', '#fdecea', '#e53935'],
+                'url-error': ['Excel sa nestiahol — skús znova', '#fdecea', '#e53935'],
                 unsupported: ['Prehliadač nepodporuje zapamätanie', '#fdecea', '#e53935'],
                 nofile: ['Vybrať Excel', '#f5f5f5', '#ccc'],
             };
@@ -1345,7 +1396,8 @@
             loadButton.type = 'button';
             loadButton.style.cssText = 'padding:6px 10px;border:1px solid #ccc;border-radius:6px;background:#f5f5f5;cursor:pointer;font-size:0.75rem;margin-right:8px;align-self:center;';
             loadButton.addEventListener('click', () => {
-                if (pendingHandle) confirmPermissionAndLoad(pendingHandle);
+                if (settings.excel.url) loadExcelFromUrl(settings.excel.url);
+                else if (pendingHandle) confirmPermissionAndLoad(pendingHandle);
                 else pickFileAndRemember();
             });
 
@@ -1391,7 +1443,12 @@
         }
 
         DomWatch.add(ensureButton);
-        onReady(tryAutoLoad);
+        onReady(() => {
+            // ak je v nastaveniach adresa, tahame odtial automaticky;
+            // inak sa subor vybera rucne a prehliadac si ho pamata
+            if (settings.excel.url) loadExcelFromUrl(settings.excel.url);
+            else tryAutoLoad();
+        });
     }
 
     /* --------------------- 3.8 Ladiaci vypis ---------------------------- */
@@ -1560,6 +1617,7 @@
         MODULES.forEach((m) => { draftModules[m.id] = isModuleOn(m); });
         const draftUsers = settings.users.map((u) => ({ ...u }));
         const draftPdm = { ...settings.pdm };
+        const draftExcel = { ...settings.excel };
 
         const overlay = document.createElement('div');
         overlay.id = OVERLAY_ID;
@@ -1786,6 +1844,63 @@
         pdmTable.appendChild(pdmBody);
         body.appendChild(pdmTable);
 
+        // --- Excel s vykresmi ---
+        const hExcel = document.createElement('h3');
+        hExcel.textContent = 'Excel s výkresmi';
+        body.appendChild(hExcel);
+
+        const excelUrlTable = document.createElement('table');
+        excelUrlTable.innerHTML = '<thead><tr><th>Adresa Excelu (nepovinné)</th></tr></thead>';
+        const excelUrlBody = document.createElement('tbody');
+        const excelUrlTr = document.createElement('tr');
+        const tdUrl = document.createElement('td');
+        const inpUrl = document.createElement('input');
+        inpUrl.type = 'text';
+        inpUrl.value = draftExcel.url || '';
+        inpUrl.placeholder = 'http://172.16.77.134:9000/automated180.xlsx';
+        inpUrl.addEventListener('input', () => { draftExcel.url = inpUrl.value.trim(); });
+        tdUrl.appendChild(inpUrl);
+        excelUrlTr.appendChild(tdUrl);
+        excelUrlBody.appendChild(excelUrlTr);
+        excelUrlTable.appendChild(excelUrlBody);
+        body.appendChild(excelUrlTable);
+
+        const excelNote = document.createElement('p');
+        excelNote.className = 'pda-note';
+        excelNote.innerHTML =
+            'Ak sem zadáš adresu začínajúcu <b>http://</b> alebo <b>https://</b>, Excel sa stiahne sám pri každom otvorení aplikácie.<br>' +
+            'Ak pole necháš prázdne, súbor sa vyberá ručne tlačidlom <b>„Vybrať Excel"</b> a prehliadač si ho zapamätá.<br>' +
+            '<b>Cesta na disku ani sieťový disk sem nepatria</b> (<code>C:\\…</code>, <code>\\\\server\\…</code>) — prehliadač zo zásady ' +
+            'nevie otvoriť súbor podľa cesty, vtedy treba tlačidlo na ručný výber.';
+        body.appendChild(excelNote);
+
+        const colTable = document.createElement('table');
+        colTable.style.marginTop = '9px';
+        colTable.innerHTML =
+            '<thead><tr><th>Stĺpec — číslo zákazky</th><th>Stĺpec — číslo výkresu</th><th>Stĺpec — verzia</th></tr></thead>';
+        const colBody = document.createElement('tbody');
+        const colTr = document.createElement('tr');
+
+        [['colOrder', 'H'], ['colDrawing', 'AH'], ['colVersion', 'AI']].forEach(([field, ph]) => {
+            const td = document.createElement('td');
+            const inp = document.createElement('input');
+            inp.type = 'text';
+            inp.value = draftExcel[field] || '';
+            inp.placeholder = ph;
+            inp.addEventListener('input', () => { draftExcel[field] = inp.value.trim().toUpperCase(); });
+            td.appendChild(inp);
+            colTr.appendChild(td);
+        });
+
+        colBody.appendChild(colTr);
+        colTable.appendChild(colBody);
+        body.appendChild(colTable);
+
+        const colNote = document.createElement('p');
+        colNote.className = 'pda-note';
+        colNote.textContent = 'Písmená stĺpcov tak, ako ich vidíš v Exceli. Predvolene H, AH a AI.';
+        body.appendChild(colNote);
+
         // --- paticka ---
         const foot = document.createElement('div');
         foot.className = 'pda-set-foot';
@@ -1824,6 +1939,7 @@
             saveJson(KEY_MODULES, draftModules);
             saveJson(KEY_USERS, draftUsers.filter((u) => u.username));
             saveJson(KEY_PDM, draftPdm);
+            saveJson(KEY_EXCEL, draftExcel);
             close();
             shared.intentionalReload = true;
             location.reload();
