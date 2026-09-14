@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PDA Suite (HF Slovakia)
 // @namespace    http://tampermonkey.net/
-// @version      1.8.0
+// @version      1.9.0
 // @description  Vsetky vylepsenia PDA v jednom skripte + panel na zapinanie a vypinanie jednotlivych modulov
 // @author       Gabris, Tvarozek
 // @updateURL    https://github.com/JaroTvarozek/HF-PDA-scripts/raw/refs/heads/main/pda-suite.user.js
@@ -1203,8 +1203,30 @@
             parseWorkbook(new Uint8Array(await file.arrayBuffer()));
         }
 
-        // Excel stiahnuty z adresy (http://...). GM_xmlhttpRequest obchadza CORS,
-        // takze sa da siahnut aj na interny server.
+        /*
+         * Zdroj Excelu z nastaveni:
+         *   http(s)://...          -> stiahne sa zo servera
+         *   C:\...  alebo  \\server\... alebo file:///... -> precita sa z disku cez file://
+         *      (rovnako ako v Python appke; Tampermonkey na to potrebuje zapnute
+         *       "Povolit pristup k URL adresam suborov" na stranke chrome://extensions)
+         *   prazdne                -> rucny vyber suboru, prehliadac si ho zapamata
+         */
+        function excelSource() {
+            let raw = String(settings.excel.url || '').trim().replace(/^"+|"+$/g, '');
+            if (!raw) return { kind: 'none', url: '', raw: '' };
+            if (/^https?:\/\//i.test(raw)) return { kind: 'http', url: raw, raw };
+            if (/^file:\/\//i.test(raw)) return { kind: 'file', url: raw, raw };
+            if (/^\\\\/.test(raw)) {                       // \\server\share\subor -> file://server/share/subor
+                return { kind: 'file', url: 'file:' + encodeURI(raw.replace(/\\/g, '/')), raw };
+            }
+            if (/^[a-zA-Z]:[\\/]/.test(raw)) {               // C:\priecinok\subor -> file:///C:/priecinok/subor
+                return { kind: 'file', url: 'file:///' + encodeURI(raw.replace(/\\/g, '/')), raw };
+            }
+            return { kind: 'invalid', url: '', raw };
+        }
+
+        // Excel stiahnuty z adresy (http://... alebo file://...). GM_xmlhttpRequest obchadza CORS,
+        // takze sa da siahnut aj na interny server; pri file:// vracia Chrome status 0.
         function fetchExcel(url) {
             return new Promise((resolve, reject) => {
                 GM_xmlhttpRequest({
@@ -1212,14 +1234,20 @@
                     url,
                     responseType: 'arraybuffer',
                     onload: (r) => {
-                        if (r.status < 200 || r.status >= 300) {
-                            reject(new Error('HTTP ' + r.status));
+                        const hasData = r.response && r.response.byteLength > 0;
+                        const ok = (r.status >= 200 && r.status < 300 && hasData) || (r.status === 0 && hasData);
+                        if (!ok) {
+                            reject(new Error(r.status === 0
+                                ? 'prehliadač súbor nevydal — chýba povolenie prístupu k súborom?'
+                                : 'HTTP ' + r.status));
                             return;
                         }
                         resolve(r.response);
                     },
-                    onerror: () => reject(new Error('spojenie so serverom zlyhalo')),
-                    ontimeout: () => reject(new Error('server neodpovedal včas')),
+                    onerror: () => reject(new Error(/^file:/i.test(url)
+                        ? 'súbor sa nedá otvoriť — cesta alebo povolenie prístupu k súborom'
+                        : 'spojenie so serverom zlyhalo')),
+                    ontimeout: () => reject(new Error('zdroj neodpovedal včas')),
                 });
             });
         }
@@ -1231,8 +1259,8 @@
                 if (!buffer) throw new Error('prázdna odpoveď');
                 parseWorkbook(new Uint8Array(buffer));
             } catch (e) {
-                console.warn(LOG, 'Excel sa nepodarilo stiahnuť z adresy', url, e);
-                updateLoadButtonState('url-error');
+                console.warn(LOG, 'Excel sa nepodarilo načítať z', url, e);
+                updateLoadButtonState(/^file:/i.test(url) ? 'file-denied' : 'url-error');
             }
         }
 
@@ -1697,7 +1725,8 @@
                 'needs-permission': ['Povoliť prístup k Excelu', '#fff4e5', '#f9a825'],
                 error: ['Chyba, skús znova', '#fdecea', '#e53935'],
                 'url-error': ['Excel sa nestiahol — skús znova', '#fdecea', '#e53935'],
-                'url-invalid': ['Adresa Excelu nie je http — klik otvorí nastavenia', '#fff4e5', '#f9a825'],
+                'url-invalid': ['Adresa Excelu je nezrozumiteľná — klik otvorí nastavenia', '#fff4e5', '#f9a825'],
+                'file-denied': ['Excel z disku sa nenačítal — zapni prístup k súborom v Tampermonkey', '#fdecea', '#e53935'],
                 unsupported: ['Prehliadač nepodporuje zapamätanie', '#fdecea', '#e53935'],
                 // Excel uz nie je podmienkou - vykres sa najde aj podla materialu
                 nofile: ['Excel (nepovinné)', '#f5f5f5', '#ccc'],
@@ -1725,9 +1754,9 @@
             loadButton.type = 'button';
             loadButton.style.cssText = 'padding:6px 10px;border:1px solid #ccc;border-radius:6px;background:#f5f5f5;cursor:pointer;font-size:0.75rem;margin-right:8px;align-self:center;';
             loadButton.addEventListener('click', () => {
-                const url = String(settings.excel.url || '').trim();
-                if (url && !/^https?:\/\//i.test(url)) openSettings();
-                else if (url) loadExcelFromUrl(url);
+                const src = excelSource();
+                if (src.kind === 'invalid') openSettings();
+                else if (src.kind === 'http' || src.kind === 'file') loadExcelFromUrl(src.url);
                 else if (pendingHandle) confirmPermissionAndLoad(pendingHandle);
                 else pickFileAndRemember();
             });
@@ -1790,13 +1819,12 @@
         onReady(() => {
             // ak je v nastaveniach adresa, tahame odtial automaticky;
             // inak sa subor vybera rucne a prehliadac si ho pamata
-            const url = String(settings.excel.url || '').trim();
-            if (url && !/^https?:\/\//i.test(url)) {
-                // cesta na disk (C:\... alebo \\server\...) nie je adresa - prehliadac ju neotvori
-                console.warn(LOG, 'adresa Excelu nie je http(s), ignorujem:', url);
+            const src = excelSource();
+            if (src.kind === 'http' || src.kind === 'file') {
+                loadExcelFromUrl(src.url);
+            } else if (src.kind === 'invalid') {
+                console.warn(LOG, 'adresa Excelu je nezrozumiteľná, ignorujem:', src.raw);
                 updateLoadButtonState('url-invalid');
-            } else if (url) {
-                loadExcelFromUrl(url);
             } else {
                 tryAutoLoad();
             }
@@ -2555,7 +2583,7 @@ body.${BODY_CLASS} #${PANEL_ID} .sapMPanelContent > :not(#${OVERVIEW_ID}) { disp
         const inpUrl = document.createElement('input');
         inpUrl.type = 'text';
         inpUrl.value = draftExcel.url || '';
-        inpUrl.placeholder = 'http://172.16.77.134:9000/automated180.xlsx';
+        inpUrl.placeholder = 'C:\\Users\\meno\\OneDrive - HF MIXING GROUP\\HFSK O.4 Production - Data source\\AutomatedOQ180.xlsx';
         inpUrl.addEventListener('input', () => { draftExcel.url = inpUrl.value.trim(); });
         tdUrl.appendChild(inpUrl);
         excelUrlTr.appendChild(tdUrl);
@@ -2566,10 +2594,10 @@ body.${BODY_CLASS} #${PANEL_ID} .sapMPanelContent > :not(#${OVERVIEW_ID}) { disp
         const excelNote = document.createElement('p');
         excelNote.className = 'pda-note';
         excelNote.innerHTML =
-            'Ak sem zadáš adresu začínajúcu <b>http://</b> alebo <b>https://</b>, Excel sa stiahne sám pri každom otvorení aplikácie.<br>' +
-            'Ak pole necháš prázdne, súbor sa vyberá ručne tlačidlom <b>„Vybrať Excel"</b> a prehliadač si ho zapamätá.<br>' +
-            '<b>Cesta na disku ani sieťový disk sem nepatria</b> (<code>C:\\…</code>, <code>\\\\server\\…</code>) — prehliadač zo zásady ' +
-            'nevie otvoriť súbor podľa cesty, vtedy treba tlačidlo na ručný výber.';
+            'Sem môžeš dať <b>cestu na disku</b> tak ako v Python appke (<code>C:\\…</code> alebo <code>\\\\server\\…</code>) — Excel sa načíta sám pri každom otvorení aplikácie. ' +
+            '<b>Podmienka:</b> na stránke <code>chrome://extensions</code> → Tampermonkey → Podrobnosti zapnúť <b>„Povoliť prístup k URL adresám súborov"</b>.<br>' +
+            'Funguje aj adresa <b>http(s)://</b>, ak by Excel visel na serveri.<br>' +
+            'Ak pole necháš prázdne, súbor sa vyberá ručne tlačidlom <b>„Excel (nepovinné)"</b> a prehliadač si ho zapamätá.';
         body.appendChild(excelNote);
 
         const colTable = document.createElement('table');
