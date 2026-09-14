@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PDA Suite (HF Slovakia)
 // @namespace    http://tampermonkey.net/
-// @version      1.7.0
+// @version      1.8.0
 // @description  Vsetky vylepsenia PDA v jednom skripte + panel na zapinanie a vypinanie jednotlivych modulov
 // @author       Gabris, Tvarozek
 // @updateURL    https://github.com/JaroTvarozek/HF-PDA-scripts/raw/refs/heads/main/pda-suite.user.js
@@ -1321,6 +1321,74 @@
             }
         }
 
+        /*
+         * Mapa vyrobna zakazka -> { kluc (cislo vykresu alebo material), typ, revizia }.
+         * Stiahne sa zo sluzby RAZ pri starte (endpoint /zakazky = unikatne zakazky z Excelu,
+         * prvy vyskyt vyhrava) a drzi sa v pamati aj v ulozisku Tampermonkey, aby prezila
+         * obnovenie stranky. Znovu sa stahuje len ked sa na serveri zmeni odtlacok mapy.
+         * Do Excelu sa z prehliadaca nechodi vobec - cita ho server raz denne.
+         */
+        const KEY_ORDER_MAP = 'pda_zakazky_cache_v1';
+        let orderMap = null;
+        let orderMapStamp = '';
+        let orderMapLoading = false;
+
+        (function restoreOrderMap() {
+            const c = loadJson(KEY_ORDER_MAP, null);
+            if (c && c.zakazky) {
+                orderMap = c.zakazky;
+                orderMapStamp = String(c.mapa_z || '');
+                console.log(LOG, 'mapa zákaziek z úložiska:', Object.keys(orderMap).length, 'zákaziek (mapa z ' + orderMapStamp + ')');
+            }
+        })();
+
+        function pdmGetJson(path, timeout) {
+            return new Promise((resolve, reject) => {
+                GM_xmlhttpRequest({
+                    method: 'GET',
+                    url: settings.pdm.base + path,
+                    headers: settings.pdm.key ? { 'X-API-Key': settings.pdm.key } : {},
+                    timeout: timeout || 15000,
+                    onload: (r) => {
+                        if (r.status === 404) { resolve(null); return; }
+                        if (r.status < 200 || r.status >= 300) { reject(new Error('HTTP ' + r.status + ' ' + path)); return; }
+                        try { resolve(JSON.parse(r.responseText)); }
+                        catch (e) { reject(new Error('neplatná odpoveď ' + path)); }
+                    },
+                    onerror: () => reject(new Error('spojenie so službou zlyhalo')),
+                    ontimeout: () => reject(new Error('služba neodpovedala včas')),
+                });
+            });
+        }
+
+        async function loadOrderMap() {
+            if (orderMapLoading) return;
+            orderMapLoading = true;
+            try {
+                // lacna kontrola odtlacku: /health ma ~400 B, cela mapa stovky kB
+                const h = await pdmGetJson('/health', 8000);
+                const stamp = h && h.mapa && h.mapa.posledne ? String(h.mapa.posledne) : '';
+                if (orderMap && stamp && stamp === orderMapStamp) {
+                    console.log(LOG, 'mapa zákaziek je aktuálna (' + stamp + ')');
+                    return;
+                }
+                const d = await pdmGetJson('/zakazky', 30000);
+                if (!d || !d.zakazky) {
+                    console.log(LOG, 'služba ešte nemá /zakazky — hľadám po jednej zákazke');
+                    return;
+                }
+                orderMap = d.zakazky;
+                orderMapStamp = String(d.mapa_z || stamp || '');
+                saveJson(KEY_ORDER_MAP, { mapa_z: orderMapStamp, zakazky: orderMap });
+                console.log(LOG, 'mapa zákaziek stiahnutá:', d.pocet, 'zákaziek (mapa z ' + orderMapStamp + ')');
+                if (shared.currentOperation) applyForOperation(shared.currentOperation);
+            } catch (e) {
+                console.log(LOG, 'mapa zákaziek sa nestiahla:', e.message);
+            } finally {
+                orderMapLoading = false;
+            }
+        }
+
         let lastOperationKey = null;
 
         function pollSelectedOperation() {
@@ -1333,6 +1401,7 @@
             else updateDisplay(null);
         }
 
+        onReady(loadOrderMap);
         onReady(() => setInterval(pollSelectedOperation, 500));
 
         function stripLeadingApostrophe(value) {
@@ -1389,7 +1458,11 @@
 
             // 2) sluzba vykresov pozna denny export -> kluc priamo pre tuto vyrobnu zakazku
             try {
-                const z = await pdmOrderLookup(current.productionOrderNo);
+                const cislo = normalizeOrderKey(current.productionOrderNo);
+                const local = orderMap && cislo ? orderMap[cislo] : null;
+                const z = local
+                    ? { kluc: local.kluc, typ: local.typ, revizia: local.revizia, pocet: 0 }
+                    : await pdmOrderLookup(current.productionOrderNo);
                 if (token !== lookupToken) return;
                 if (z && z.kluc) {
                     const isDrawing = z.typ !== 'material';
