@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PDA Suite (HF Slovakia)
 // @namespace    http://tampermonkey.net/
-// @version      1.4.0
+// @version      1.5.0
 // @description  Vsetky vylepsenia PDA v jednom skripte + panel na zapinanie a vypinanie jednotlivych modulov
 // @author       Gabris, Tvarozek
 // @updateURL    https://github.com/JaroTvarozek/HF-PDA-scripts/raw/refs/heads/main/pda-suite.user.js
@@ -1596,17 +1596,65 @@
         let lastSignature = null;
         let wcByName = {};            // popis pracoviska -> { code }
 
-        // kod pracoviska sa da spolahlivo vytiahnut z odpovede servera
+        let groupField = null; // nazov pola v datach, ktore sluzi ako kategoria
+
+        /*
+         * Kategoria pracoviska sa berie priamo z dat, nie z nastaveni.
+         * Medzi polami workcenteru sa hlada take, ktore sa sprava ako
+         * ciselnik: ma malo roznych hodnot, ale viac ako jednu, a je
+         * vyplnene takmer vsade. Cislo a nazov pracoviska su unikatne,
+         * takze do vyberu nepadnu.
+         */
+        function detectGroupField(list) {
+            const IGNORE = ['workcenter', 'workcenterDescription', 'operationList'];
+            const stats = {};
+
+            list.forEach((wc) => {
+                Object.keys(wc).forEach((k) => {
+                    if (IGNORE.indexOf(k) !== -1) return;
+                    const v = wc[k];
+                    if (typeof v !== 'string' && typeof v !== 'number') return;
+                    const s = String(v).trim();
+                    if (!s) return;
+                    if (!stats[k]) stats[k] = { values: new Set(), filled: 0 };
+                    stats[k].values.add(s);
+                    stats[k].filled++;
+                });
+            });
+
+            const maxDistinct = Math.max(12, Math.floor(list.length / 5));
+            const candidates = Object.keys(stats).map((k) => ({
+                key: k,
+                distinct: stats[k].values.size,
+                coverage: stats[k].filled / list.length,
+                sample: Array.from(stats[k].values).slice(0, 6),
+            })).filter((c) => c.distinct >= 2 && c.distinct <= maxDistinct && c.coverage >= 0.8);
+
+            candidates.sort((a, b) => (b.coverage - a.coverage) || (a.distinct - b.distinct));
+
+            console.log(LOG, 'polia vhodné ako kategória pracoviska:',
+                candidates.length
+                    ? candidates.map((c) => c.key + ' (' + c.distinct + ' hodnôt: ' + c.sample.join(', ') + ')')
+                    : 'žiadne — použijú sa vzory z nastavení');
+
+            return candidates[0] || null;
+        }
+
         XhrBus.subscribe((ev) => {
             if (!ev.request || ev.request.BOMethod !== 'getOperationListTempForWorkcenters') return;
             const list = ev.response && ev.response.result && ev.response.result.aOperationListTempForWorkcenter;
-            if (!list) return;
+            if (!list || !list.length) return;
+
             const map = {};
             list.forEach((wc) => {
-                if (wc.workcenterDescription) map[wc.workcenterDescription] = { code: wc.workcenter };
+                if (wc.workcenterDescription) map[wc.workcenterDescription] = wc;
             });
             wcByName = map;
-            lastSignature = null; // vynuti prekreslenie s doplnenymi kodmi
+
+            groupField = detectGroupField(list);
+            console.log(LOG, 'kategórie pracovísk sa berú z poľa:', groupField ? groupField.key : '(vzory z nastavení)');
+
+            lastSignature = null; // vynuti prekreslenie s doplnenymi udajmi
         });
 
         function injectStyles() {
@@ -1707,11 +1755,13 @@
             return Array.from(document.querySelectorAll(TILE_SELECTOR)).map((tile) => {
                 const name = getTileName(tile);
                 const online = readOnlineCount(tile);
-                const known = wcByName[name];
+                const wc = wcByName[name];
                 return {
                     tile,
                     name,
-                    code: known ? known.code : '',
+                    code: wc ? String(wc.workcenter || '') : '',
+                    // kategoria priamo z dat, ak sa take pole naslo
+                    group: wc && groupField ? String(wc[groupField.key] || '').trim() : '',
                     online: online === null ? 0 : online,
                     onlineKnown: online !== null,
                 };
@@ -1727,10 +1777,29 @@
         }
 
         function buildGroups(entries) {
-            const defs = parseGroups();
             const buckets = new Map();
-            defs.forEach((g) => buckets.set(g.name, { def: g, items: [] }));
+            const fromData = entries.some((e) => e.group);
 
+            if (fromData) {
+                // kategorie priamo z dat - ziadne vzory, ziadne nastavovanie
+                entries.forEach((e) => {
+                    const name = e.group || 'Ostatné';
+                    if (!buckets.has(name)) {
+                        buckets.set(name, {
+                            def: { name, subtitle: groupField ? 'podľa poľa ' + groupField.key : '' },
+                            items: [],
+                        });
+                    }
+                    buckets.get(name).items.push(e);
+                });
+                return Array.from(buckets.values())
+                    .filter((b) => b.items.length > 0)
+                    .sort((a, b) => b.items.length - a.items.length);
+            }
+
+            // zaloha, ak sa v datach nic vhodne nenaslo
+            const defs = parseGroups();
+            defs.forEach((g) => buckets.set(g.name, { def: g, items: [] }));
             entries.forEach((e) => {
                 const name = groupOf(e, defs);
                 if (!buckets.has(name)) {
@@ -1738,14 +1807,25 @@
                 }
                 buckets.get(name).items.push(e);
             });
-
             return Array.from(buckets.values()).filter((b) => b.items.length > 0);
         }
 
-        const ICONS = {
-            'Assembly': '🔧', 'Welding': '🔥', 'Machining': '⚙',
-            'Quality Control': '🔎', 'Ostatné': '📦',
-        };
+        // ikona sa hada z nazvu kategorie, lebo nazvy prichadzaju z dat
+        const ICON_RULES = [
+            [/ZVAR|WELD|TIG|MIG/, '🔥'],
+            [/MONTAZ|MONT|ASSEMBL/, '🔧'],
+            [/CNC|MACHIN|OBRAB|FREZ|SUSTR|BRUS/, '⚙'],
+            [/OTK|KONTROL|MERAN|QUALIT|KVALIT/, '🔎'],
+            [/LAK|FARB|PAINT/, '🎨'],
+            [/PEC|ZIHA|KALEN|HEAT/, '🌡'],
+            [/SKLAD|LOGIST|EXPED/, '📦'],
+        ];
+
+        function iconFor(name) {
+            const n = normalize(name);
+            for (const [re, icon] of ICON_RULES) if (re.test(n)) return icon;
+            return '🏭';
+        }
 
         function render(host, entries) {
             host.innerHTML = '';
@@ -1773,7 +1853,7 @@
                 head.type = 'button';
                 head.className = 'ov-gh';
                 head.innerHTML =
-                    '<div class="ov-ic">' + (ICONS[gName] || '📦') + '</div>' +
+                    '<div class="ov-ic">' + iconFor(gName) + '</div>' +
                     '<div class="ov-gt"><b></b><span></span></div>' +
                     '<div class="ov-num"><b>' + bucket.items.length + '</b><span>PRACOVÍSK</span></div>' +
                     '<div class="ov-num on"><b>' + onlineCount + '</b><span>ONLINE</span></div>' +
