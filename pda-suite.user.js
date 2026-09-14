@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PDA Suite (HF Slovakia)
 // @namespace    http://tampermonkey.net/
-// @version      1.0.0
+// @version      1.1.0
 // @description  Vsetky vylepsenia PDA v jednom skripte + panel na zapinanie a vypinanie jednotlivych modulov
 // @author       Gabris, Tvarozek
 // @updateURL    https://github.com/JaroTvarozek/HF-PDA-scripts/raw/refs/heads/main/pda-suite.user.js
@@ -1682,6 +1682,78 @@
             usersWrap.appendChild(note);
         }
         renderUsers();
+
+        // --- hromadne zadanie / prenos na iny pocitac ---
+        const ioWrap = document.createElement('div');
+        ioWrap.style.cssText = 'margin-top:12px;border:1px dashed #ccd1d9;border-radius:9px;padding:11px 12px;';
+
+        const ioTitle = document.createElement('div');
+        ioTitle.textContent = 'Hromadné zadanie / prenos na iný počítač';
+        ioTitle.style.cssText = 'font-weight:600;font-size:.88rem;margin-bottom:4px;';
+
+        const ioHelp = document.createElement('div');
+        ioHelp.className = 'pda-note';
+        ioHelp.style.marginTop = '0';
+        const IO_HELP_DEFAULT = 'Jeden používateľ na riadok vo formáte:  Meno;osobné číslo;ID karty   (ID karty môže ostať prázdne)';
+        ioHelp.textContent = IO_HELP_DEFAULT;
+
+        const ta = document.createElement('textarea');
+        ta.rows = 5;
+        ta.spellcheck = false;
+        ta.placeholder = 'Ján Novák;12345;0116984be8';
+        ta.style.cssText = 'width:100%;box-sizing:border-box;margin-top:7px;padding:8px 10px;' +
+            'border:1px solid #ccd1d9;border-radius:6px;font:12px/1.5 ui-monospace,Consolas,monospace;resize:vertical;';
+
+        const ioBtns = document.createElement('div');
+        ioBtns.style.cssText = 'display:flex;gap:8px;margin-top:7px;';
+
+        const btnImport = document.createElement('button');
+        btnImport.type = 'button';
+        btnImport.className = 'pda-add';
+        btnImport.style.marginTop = '0';
+        btnImport.textContent = 'Načítať z textu';
+        btnImport.addEventListener('click', () => {
+            const parsed = ta.value
+                .split('\n')
+                .map((line) => line.trim())
+                .filter((line) => line && line.indexOf(';') !== -1)
+                .map((line) => {
+                    const parts = line.split(';').map((s) => (s || '').trim());
+                    return { username: parts[0], password: parts[1] || '', cardId: parts[2] || '' };
+                })
+                .filter((u) => u.username);
+
+            if (parsed.length === 0) {
+                ioHelp.style.color = '#b0201a';
+                ioHelp.textContent = 'Nenašiel sa žiadny platný riadok. Formát je: Meno;osobné číslo;ID karty';
+                return;
+            }
+
+            draftUsers.length = 0;
+            parsed.forEach((u) => draftUsers.push(u));
+            renderUsers();
+            ioHelp.style.color = '';
+            ioHelp.textContent = 'Načítaných používateľov: ' + parsed.length + '. Ešte to ulož tlačidlom dole.';
+        });
+
+        const btnExport = document.createElement('button');
+        btnExport.type = 'button';
+        btnExport.className = 'pda-add';
+        btnExport.style.marginTop = '0';
+        btnExport.textContent = 'Vypísať súčasných';
+        btnExport.addEventListener('click', () => {
+            ta.value = draftUsers.map((u) => [u.username, u.password, u.cardId].join(';')).join('\n');
+            ioHelp.style.color = '';
+            ioHelp.textContent = IO_HELP_DEFAULT;
+        });
+
+        ioBtns.appendChild(btnImport);
+        ioBtns.appendChild(btnExport);
+        ioWrap.appendChild(ioTitle);
+        ioWrap.appendChild(ioHelp);
+        ioWrap.appendChild(ta);
+        ioWrap.appendChild(ioBtns);
+        body.appendChild(ioWrap);
 
         // --- vykresy ---
         const hPdm = document.createElement('h3');
