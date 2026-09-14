@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PDA Suite (HF Slovakia)
 // @namespace    http://tampermonkey.net/
-// @version      1.9.0
+// @version      1.11.0
 // @description  Vsetky vylepsenia PDA v jednom skripte + panel na zapinanie a vypinanie jednotlivych modulov
 // @author       Gabris, Tvarozek
 // @updateURL    https://github.com/JaroTvarozek/HF-PDA-scripts/raw/refs/heads/main/pda-suite.user.js
@@ -53,6 +53,8 @@
     const KEY_PDM = 'pda_pdm_v1';
     const KEY_EXCEL = 'pda_excel_v1';
     const KEY_GROUPS = 'pda_groups_v1';
+    const KEY_BUTTONS = 'pda_buttons_v1';
+    const KEY_ADMIN = 'pda_admin_v1';
 
     function loadJson(key, fallback) {
         try {
@@ -86,6 +88,10 @@
             'Machining|CNC a konvenčné obrábanie|CNC,FREZ,SUSTR,BRUS,LMS,HMS,K-TEC,VRTA,PILA,HOBL,HEDELL',
             'Quality Control|Kontrola a meranie|OTK,KONTROL,MERAN,QC,KVALIT',
         ].join('\n')),
+        // pravidla farieb tlacidiel; null = pri prvom spusteni sa nasadia predvolene
+        buttons: loadJson(KEY_BUTTONS, null),
+        // heslo na ozubene koliesko a prepinac 'nastavovanie tlacidiel pravym klikom'
+        admin: loadJson(KEY_ADMIN, { password: '123456', pickMode: false }),
     };
 
     // "H" -> 7, "AH" -> 33 (vracia 0-based index stlpca ako ho vidi XLSX)
@@ -466,58 +472,216 @@
         DomWatch.add(apply);
     }
 
-    /* ------------------ 3.2 Farebne stavove tlacidla -------------------- */
+    /* ------------------ 3.2 Farebne tlacidla (pravidla) ----------------- */
 
-    function modStatusButtons() {
+    /*
+     * Portovane z Python appky (SKIN + PICKER v pda_action.py, karta "Farby tlacidiel").
+     *  - pravidla { text, id, bg, fg, poradie } su v nastaveniach (ulozisko Tampermonkey),
+     *    NIE v kode; pri prvom spusteni sa nasadia predvolene farby stavovych tlacidiel,
+     *    takze sa oproti doterajsiemu spravaniu nic nemeni
+     *  - matchuje sa podla TEXTU tlacidla ("obsahuje", bez ohladu na velkost pismen);
+     *    ID sa pouzije len ked tlacidlo text nema - ID stavovych tlacidiel obsahuje
+     *    poradove cislo, ktore sa lisi podla pracoviska
+     *  - farba textu sa dopocita z jasu pozadia
+     *  - pravy klik na tlacidlo (ked je v nastaveniach zapnute "Nastavovanie tlacidiel")
+     *    ukaze paletu 12 farieb + Reset; vyber sa hned ulozi a nanesie
+     *  - `poradie` drzi doterajsie zoradenie stavovych tlacidiel (vyroba, prestoj, chyba)
+     */
+    const DEFAULT_BUTTON_RULES = [
+        { text: 'Výroba', id: '', bg: '#4e9041', fg: '#ffffff', poradie: 0 },
+        { text: 'Upinanie', id: '', bg: '#4e9041', fg: '#ffffff', poradie: 0 },
+        { text: 'Programovanie', id: '', bg: '#d66c37', fg: '#ffffff', poradie: 1 },
+        { text: 'Upratovanie stola', id: '', bg: '#d66c37', fg: '#ffffff', poradie: 1 },
+        { text: 'Meranie v Procese s OTK', id: '', bg: '#d66c37', fg: '#ffffff', poradie: 1 },
+        { text: 'Chyba programu', id: '', bg: '#d04040', fg: '#ffffff', poradie: 2 },
+    ];
+
+    // rovnakych 12 farieb ako v Python verzii
+    const BUTTON_PALETTE = ['#16a34a', '#65a30d', '#eab308', '#d97706', '#dc2626', '#db2777',
+                            '#7c3aed', '#2563eb', '#0891b2', '#7c4a1e', '#64748b', '#1e293b'];
+
+    function contrastColor(hex) {
+        const h = String(hex || '').replace('#', '');
+        if (h.length !== 6) return '#ffffff';
+        const r = parseInt(h.slice(0, 2), 16), g = parseInt(h.slice(2, 4), 16), b = parseInt(h.slice(4, 6), 16);
+        return (0.299 * r + 0.587 * g + 0.114 * b) > 150 ? '#1e293b' : '#ffffff';
+    }
+
+    function normalizeRule(r) {
+        const bg = /^#[0-9a-f]{6}$/i.test(String(r.bg || '')) ? String(r.bg).toLowerCase() : '#2563eb';
+        const fg = /^#[0-9a-f]{6}$/i.test(String(r.fg || '')) ? String(r.fg).toLowerCase() : contrastColor(bg);
+        const poradie = Number.isFinite(Number(r.poradie)) ? Number(r.poradie) : 1.5;
+        return { text: String(r.text || '').trim(), id: String(r.id || '').trim(), bg, fg, poradie };
+    }
+
+    function buttonRules() {
+        if (!Array.isArray(settings.buttons)) {
+            settings.buttons = DEFAULT_BUTTON_RULES.map((r) => Object.assign({}, r));
+        }
+        return settings.buttons;
+    }
+
+    function saveButtonRules(rules) {
+        settings.buttons = rules.map(normalizeRule).filter((r) => r.text || r.id);
+        saveJson(KEY_BUTTONS, settings.buttons);
+        mirrorSettingsToFile(false);
+    }
+
+    // rovnake pravidlo ako Python `bezPravidla`: pravidlo "patri" tlacidlu podla textu alebo ID
+    function ruleMatches(rule, txt, id) {
+        const t = String(rule.text || '').toLowerCase();
+        return (t && String(txt || '').toLowerCase().indexOf(t) !== -1) || (rule.id && rule.id === id);
+    }
+
+    function modButtonColors() {
         const CONTAINER_ID = 'WorkcenterDetail--Order_Status_Flexbox';
-        const COLORS = { productive: '#4e9041', downtime: '#d66c37', fault: '#d04040' };
-        const PRIORITY = { productive: 0, downtime: 1, fault: 2 };
-        const STATUS_MAP = {
-            'Výroba': 'productive',
-            'Upinanie': 'productive',
-            'Programovanie': 'downtime',
-            'Upratovanie stola': 'downtime',
-            'Meranie v Procese s OTK': 'downtime',
-            'Chyba programu': 'fault',
-        };
+        const OWN_UI = '#__pda_settings_overlay__, #__pda_settings_pass__, #__pda_overview__, #__pda_pdm_overlay__, #__pda_button_menu__';
 
         function textOf(btn) {
-            const el = btn.querySelector('.sapMBtnContent bdi, .sapMBtnContent');
-            return el ? el.textContent.trim() : '';
+            return (btn.textContent || '').trim();
         }
 
-        function styleButton(btn) {
-            const inner = btn.querySelector('.sapMBtnInner');
-            [btn, inner].forEach((el) => el && el.style.setProperty('border-radius', '10px', 'important'));
+        // najkonkretnejsie (najdlhsie) textove pravidlo vyhrava; ID len ak nic textove nesedi
+        function ruleFor(btn) {
+            const txt = textOf(btn).toLowerCase();
+            const id = btn.id || '';
+            let best = null, byId = null;
+            for (const r of buttonRules()) {
+                const t = String(r.text || '').toLowerCase();
+                if (t) {
+                    if (txt.indexOf(t) !== -1 && (!best || t.length > String(best.text).length)) best = r;
+                } else if (r.id && r.id === id) {
+                    byId = r;
+                }
+            }
+            return best || byId;
+        }
 
-            const category = STATUS_MAP[textOf(btn)];
-            if (!category) return;
-            const color = COLORS[category];
-            [btn, inner].forEach((el) => {
-                if (!el) return;
-                el.style.setProperty('background-color', color, 'important');
-                el.style.setProperty('border-color', color, 'important');
-            });
+        function paint(btn, rule) {
+            const inner = btn.querySelector('.sapMBtnInner') || btn;
+            const content = btn.querySelector('.sapMBtnContent');
+            if (rule) {
+                inner.style.setProperty('background-image', 'none', 'important'); // gradient temy by farbu prekryl
+                inner.style.setProperty('background-color', rule.bg, 'important');
+                inner.style.setProperty('border-color', rule.bg, 'important');
+                inner.style.setProperty('color', rule.fg, 'important');
+                if (content) content.style.setProperty('color', rule.fg, 'important');
+                btn.dataset.pdaPainted = '1';
+            } else if (btn.dataset.pdaPainted) {
+                ['background-image', 'background-color', 'border-color', 'color'].forEach((p) => inner.style.removeProperty(p));
+                if (content) content.style.removeProperty('color');
+                delete btn.dataset.pdaPainted;
+            }
         }
 
         function apply() {
+            document.querySelectorAll('.sapMBtn').forEach((btn) => {
+                if (btn.closest(OWN_UI)) return;
+                paint(btn, ruleFor(btn));
+                if (btn.classList.contains('statusBtn')) {
+                    [btn, btn.querySelector('.sapMBtnInner')].forEach((el) => el && el.style.setProperty('border-radius', '10px', 'important'));
+                }
+            });
+
+            // zoradenie stavovych tlacidiel podla `poradie` (0 vyroba, 1 prestoj, 2 chyba, inak 1.5)
             const container = document.getElementById(CONTAINER_ID);
             if (!container) return;
             const buttons = Array.from(container.children).filter((el) => el.classList.contains('statusBtn'));
-            if (buttons.length === 0) return;
-
-            buttons.forEach(styleButton);
-
-            const priorityOf = (btn) => {
-                const p = PRIORITY[STATUS_MAP[textOf(btn)]];
-                return p === undefined ? 1.5 : p;
+            if (buttons.length < 2) return;
+            const weight = (btn) => {
+                const r = ruleFor(btn);
+                return r && Number.isFinite(Number(r.poradie)) ? Number(r.poradie) : 1.5;
             };
-            const sorted = [...buttons].sort((a, b) => priorityOf(a) - priorityOf(b));
-            if (sorted.every((btn, i) => buttons[i] === btn)) return;
-            sorted.forEach((btn) => container.appendChild(btn));
+            const sorted = [...buttons].sort((a, b) => weight(a) - weight(b));
+            if (!sorted.every((b, i) => buttons[i] === b)) sorted.forEach((b) => container.appendChild(b));
         }
 
         DomWatch.add(apply);
+
+        /* ---- pravy klik: paleta farieb (len ked je v nastaveniach zapnute) ---- */
+
+        let menu = null;
+
+        function closeMenu() {
+            if (menu) { menu.remove(); menu = null; }
+        }
+
+        function openMenu(e, btn) {
+            closeMenu();
+            const txt = textOf(btn).slice(0, 60);
+            const id = btn.id || '';
+
+            menu = document.createElement('div');
+            menu.id = '__pda_button_menu__';
+            menu.style.cssText =
+                'position:fixed;z-index:2147483002;background:#13315c;color:#fff;' +
+                'font:12px/1.4 "Segoe UI",system-ui,sans-serif;border-radius:12px;padding:12px 14px;' +
+                'box-shadow:0 6px 20px rgba(0,0,0,.35);max-width:440px;';
+            menu.style.left = Math.max(4, Math.min(e.clientX, W.innerWidth - 460)) + 'px';
+            menu.style.top = Math.max(4, Math.min(e.clientY, W.innerHeight - 170)) + 'px';
+
+            const title = document.createElement('div');
+            title.style.cssText = 'font-weight:700;margin-bottom:4px;';
+            title.textContent = txt || '(bez textu)';
+            const sub = document.createElement('div');
+            sub.style.cssText = 'color:#a8c0e0;font-size:10px;word-break:break-all;margin-bottom:8px;';
+            sub.textContent = id || '(bez ID)';
+            const label = document.createElement('div');
+            label.style.cssText = 'color:#a8c0e0;font-size:11px;margin-bottom:4px;';
+            label.textContent = 'Zmeniť farbu';
+
+            const swatches = document.createElement('div');
+            swatches.style.marginBottom = '10px';
+            BUTTON_PALETTE.forEach((c) => {
+                const sw = document.createElement('span');
+                sw.style.cssText = 'display:inline-block;width:28px;height:28px;border-radius:8px;margin:3px;cursor:pointer;' +
+                    'border:1px solid rgba(255,255,255,.28);background:' + c + ';';
+                sw.title = c;
+                sw.addEventListener('click', (ev) => {
+                    ev.stopPropagation();
+                    const fg = contrastColor(c);
+                    const old = buttonRules().find((r) => ruleMatches(r, txt, id));
+                    const rest = buttonRules().filter((r) => !ruleMatches(r, txt, id));
+                    rest.push({ text: txt, id: txt ? '' : id, bg: c, fg, poradie: old ? old.poradie : 1.5 });
+                    saveButtonRules(rest);
+                    paint(btn, { bg: c, fg });
+                    DomWatch.poke();
+                    closeMenu();
+                });
+                swatches.appendChild(sw);
+            });
+
+            const reset = document.createElement('button');
+            reset.type = 'button';
+            reset.textContent = 'Reset tlačidla';
+            reset.style.cssText = 'background:transparent;color:#a8c0e0;border:1px solid #1c478a;border-radius:9px;' +
+                'padding:7px 14px;cursor:pointer;font:inherit;font-size:12px;';
+            reset.addEventListener('click', (ev) => {
+                ev.stopPropagation();
+                saveButtonRules(buttonRules().filter((r) => !ruleMatches(r, txt, id)));
+                paint(btn, null);
+                DomWatch.poke();
+                closeMenu();
+            });
+
+            menu.appendChild(title);
+            menu.appendChild(sub);
+            menu.appendChild(label);
+            menu.appendChild(swatches);
+            menu.appendChild(reset);
+            document.body.appendChild(menu);
+        }
+
+        document.addEventListener('click', (e) => { if (menu && !menu.contains(e.target)) closeMenu(); }, true);
+        document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeMenu(); }, true);
+        document.addEventListener('contextmenu', (e) => {
+            if (!settings.admin || !settings.admin.pickMode) return;
+            const btn = e.target && e.target.closest ? e.target.closest('.sapMBtn') : null;
+            if (!btn || btn.closest(OWN_UI)) return;
+            e.preventDefault();
+            e.stopPropagation();
+            openMenu(e, btn);
+        }, true);
     }
 
     /* ------------------ 3.3 Blokovanie tlacidla Spat -------------------- */
@@ -1047,7 +1211,7 @@
             const active = document.activeElement;
             const isButton = !!active && (active.tagName === 'BUTTON' || active.getAttribute('role') === 'button');
             // nekradne focus, ked pouzivatel pise do policka alebo je otvoreny panel nastaveni
-            if (document.getElementById('__pda_settings_overlay__')) return;
+            if (document.getElementById('__pda_settings_overlay__') || document.getElementById('__pda_settings_pass__')) return;
             if (!active || active === document.body || isButton) input.focus();
         }
 
@@ -2195,10 +2359,10 @@ body.${BODY_CLASS} #${PANEL_ID} .sapMPanelContent > :not(#${OVERVIEW_ID}) { disp
         },
         {
             id: 'statusButtons',
-            name: 'Farebné stavové tlačidlá',
-            desc: 'Výroba zelená, prestoj oranžový, chyba červená — a zoradené podľa dôležitosti.',
+            name: 'Farebné tlačidlá',
+            desc: 'Farby tlačidiel podľa pravidiel v nastaveniach (predvolene: výroba zelená, prestoj oranžový, chyba červená). Po zapnutí „Nastavovanie tlačidiel“ meníš farby pravým klikom.',
             def: true,
-            run: modStatusButtons,
+            run: modButtonColors,
         },
         {
             id: 'crossSearch',
@@ -2254,12 +2418,155 @@ body.${BODY_CLASS} #${PANEL_ID} .sapMPanelContent > :not(#${OVERVIEW_ID}) { disp
         },
     ];
 
+
+    /* ------------------------------------------------------------------
+     *  Subor s nastaveniami (zaloha / prenos medzi terminalmi).
+     *  Prehliadac nevie pisat na disk podla cesty; vie to len do suboru, ktory
+     *  clovek raz vyberie v systemovom okne "Ulozit ako" (File System Access API).
+     *  Odkaz na subor sa uklada do IndexedDB, takze prezije obnovenie stranky;
+     *  po restarte Chromu treba raz potvrdit pristup. Po kazdom ulozeni
+     *  nastaveni sa subor prepise; "Nacitat zo suboru" nahra vsetko naspat
+     *  (aj na inom pocitaci - napr. zo sietoveho disku).
+     * ---------------------------------------------------------------- */
+    const SETTINGS_FILE_KEYS = {
+        modules: KEY_MODULES, users: KEY_USERS, pdm: KEY_PDM, excel: KEY_EXCEL,
+        groups: KEY_GROUPS, buttons: KEY_BUTTONS, admin: KEY_ADMIN,
+    };
+
+    const SettingsFile = (function () {
+        const DB = 'pda_settings_db', STORE = 'handles', KEY = 'settings_file_handle';
+        let cached; // undefined = este necitane
+
+        function openDb() {
+            return new Promise((res, rej) => {
+                const q = W.indexedDB.open(DB, 1);
+                q.onupgradeneeded = () => q.result.createObjectStore(STORE);
+                q.onsuccess = () => res(q.result);
+                q.onerror = () => rej(q.error);
+            });
+        }
+        async function get() {
+            if (cached !== undefined) return cached;
+            try {
+                const db = await openDb();
+                cached = await new Promise((res, rej) => {
+                    const r = db.transaction(STORE, 'readonly').objectStore(STORE).get(KEY);
+                    r.onsuccess = () => res(r.result || null);
+                    r.onerror = () => rej(r.error);
+                });
+            } catch (e) { cached = null; }
+            return cached;
+        }
+        async function set(handle) {
+            const db = await openDb();
+            await new Promise((res, rej) => {
+                const tx = db.transaction(STORE, 'readwrite');
+                tx.objectStore(STORE).put(handle, KEY);
+                tx.oncomplete = res;
+                tx.onerror = () => rej(tx.error);
+            });
+            cached = handle;
+        }
+        async function clear() {
+            const db = await openDb();
+            await new Promise((res, rej) => {
+                const tx = db.transaction(STORE, 'readwrite');
+                tx.objectStore(STORE).delete(KEY);
+                tx.oncomplete = res;
+                tx.onerror = () => rej(tx.error);
+            });
+            cached = null;
+        }
+        return { get, set, clear, supported: typeof W.showSaveFilePicker === 'function' };
+    })();
+
+    function suiteVersion() {
+        try { return GM_info && GM_info.script ? String(GM_info.script.version) : ''; } catch (e) { return ''; }
+    }
+
+    // vsetko, co je v ulozisku Tampermonkey, v jednom objekte
+    function collectSettings() {
+        const out = {};
+        for (const k of Object.keys(SETTINGS_FILE_KEYS)) out[k] = loadJson(SETTINGS_FILE_KEYS[k], null);
+        return { aplikacia: 'PDA Suite', verzia: suiteVersion(), ulozene: new Date().toISOString(), nastavenia: out };
+    }
+
+    // nahra nastavenia zo suboru do uloziska; vrati pocet prevzatych casti
+    function applySettingsObject(obj) {
+        const n = obj && obj.nastavenia ? obj.nastavenia : obj;
+        if (!n || typeof n !== 'object' || Array.isArray(n)) throw new Error('súbor neobsahuje nastavenia PDA Suite');
+        let count = 0;
+        for (const k of Object.keys(SETTINGS_FILE_KEYS)) {
+            if (n[k] !== undefined && n[k] !== null) { saveJson(SETTINGS_FILE_KEYS[k], n[k]); count++; }
+        }
+        if (!count) throw new Error('v súbore nie je žiadna známa časť nastavení');
+        return count;
+    }
+
+    async function ensureFilePermission(handle, mode, interactive) {
+        let p = await handle.queryPermission({ mode });
+        if (p === 'granted') return true;
+        if (interactive) p = await handle.requestPermission({ mode });
+        return p === 'granted';
+    }
+
+    async function writeSettingsToHandle(handle) {
+        const w = await handle.createWritable();
+        await w.write(JSON.stringify(collectSettings(), null, 2));
+        await w.close();
+    }
+
+    // po ulozeni nastaveni prepise vybrany subor (ak je a je povoleny); nikdy nehadze chybu
+    async function mirrorSettingsToFile(interactive) {
+        try {
+            const h = await SettingsFile.get();
+            if (!h) return false;
+            if (!(await ensureFilePermission(h, 'readwrite', !!interactive))) {
+                console.log(LOG, 'súbor s nastaveniami: chýba povolenie na zápis (potvrď v nastaveniach)');
+                return false;
+            }
+            await writeSettingsToHandle(h);
+            console.log(LOG, 'nastavenia zapísané do súboru', h.name);
+            return true;
+        } catch (e) {
+            console.warn(LOG, 'zápis nastavení do súboru zlyhal', e);
+            return false;
+        }
+    }
+
+    async function pickSettingsFile() {
+        const h = await W.showSaveFilePicker({
+            suggestedName: 'pda-suite-nastavenia.json',
+            types: [{ description: 'Nastavenia PDA Suite', accept: { 'application/json': ['.json'] } }],
+        });
+        await SettingsFile.set(h);
+        await writeSettingsToHandle(h);
+        return h;
+    }
+
+    async function loadSettingsFromHandle(handle) {
+        if (!(await ensureFilePermission(handle, 'read', true))) throw new Error('chýba povolenie na čítanie súboru');
+        const file = await handle.getFile();
+        return applySettingsObject(JSON.parse(await file.text()));
+    }
+
+    function downloadSettings() {
+        const blob = new Blob([JSON.stringify(collectSettings(), null, 2)], { type: 'application/json' });
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = 'pda-suite-nastavenia.json';
+        document.body.appendChild(a);
+        a.click();
+        setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+    }
+
     /* ========================================================================
      *  5. PANEL NASTAVENI
      * ====================================================================== */
 
     const OVERLAY_ID = '__pda_settings_overlay__';
     const GEAR_ID = '__pda_settings_gear__';
+    const PASS_ID = '__pda_settings_pass__';
 
     function injectSettingsStyles() {
         if (document.getElementById('__pda_settings_styles__')) return;
@@ -2317,6 +2624,10 @@ body.${BODY_CLASS} #${PANEL_ID} .sapMPanelContent > :not(#${OVERVIEW_ID}) { disp
   width: 100%; box-sizing: border-box; padding: 6px 9px;
   border: 1px solid #ccd1d9; border-radius: 6px; font: inherit; font-size: .9rem;
 }
+.pda-set-body input[type=color] { width: 38px; height: 30px; padding: 0; border: 1px solid #ccd1d9;
+  border-radius: 6px; background: #fff; cursor: pointer; vertical-align: middle; }
+.pda-set-body input[type=number] { width: 64px; padding: 6px 8px; border: 1px solid #ccd1d9; border-radius: 6px; font: inherit; font-size: .9rem; }
+.pda-sw { display: inline-block; width: 16px; height: 16px; border-radius: 4px; border: 1px solid rgba(0,0,0,.15); vertical-align: middle; margin-right: 6px; }
 .pda-del { background: #fdecea; border: 1px solid #f0b4ae; color: #b0201a;
   border-radius: 6px; cursor: pointer; padding: 5px 10px; font-size: .82rem; }
 .pda-add { background: #eef0f4; border: 1px solid #ccd1d9; border-radius: 7px;
@@ -2335,6 +2646,50 @@ body.${BODY_CLASS} #${PANEL_ID} .sapMPanelContent > :not(#${OVERVIEW_ID}) { disp
     }
 
     function openSettings() {
+        if (document.getElementById(OVERLAY_ID) || document.getElementById(PASS_ID)) return;
+        const pwd = String((settings.admin && settings.admin.password) || '');
+        if (!pwd) { openSettingsUnlocked(); return; }
+        injectSettingsStyles();
+
+        const ov = document.createElement('div');
+        ov.id = PASS_ID;
+        ov.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:2147483001;display:flex;' +
+            'align-items:center;justify-content:center;font:14px/1.5 -apple-system,"Segoe UI",Roboto,sans-serif;color:#1a1a1f;';
+        const box = document.createElement('div');
+        box.style.cssText = 'background:#fff;border-radius:12px;width:92%;max-width:360px;padding:18px 20px;box-shadow:0 10px 40px rgba(0,0,0,.35);';
+        const t = document.createElement('div');
+        t.style.cssText = 'font-weight:600;font-size:1.02rem;margin-bottom:10px;';
+        t.textContent = 'Nastavenia PDA Suite — heslo';
+        const inp = document.createElement('input');
+        inp.type = 'password';
+        inp.autocomplete = 'off';
+        inp.style.cssText = 'width:100%;box-sizing:border-box;padding:9px 11px;border:1px solid #ccd1d9;border-radius:8px;font:inherit;font-size:1rem;';
+        const msg = document.createElement('div');
+        msg.style.cssText = 'color:#b0201a;font-size:.85rem;min-height:1.2em;margin-top:6px;';
+        const row = document.createElement('div');
+        row.style.cssText = 'display:flex;justify-content:flex-end;gap:8px;margin-top:12px;';
+        const cancel = document.createElement('button');
+        cancel.type = 'button'; cancel.className = 'pda-btn-plain'; cancel.textContent = 'Zrušiť';
+        const ok = document.createElement('button');
+        ok.type = 'button'; ok.className = 'pda-btn-primary'; ok.textContent = 'Otvoriť';
+        row.appendChild(cancel); row.appendChild(ok);
+        box.appendChild(t); box.appendChild(inp); box.appendChild(msg); box.appendChild(row);
+        ov.appendChild(box);
+        document.body.appendChild(ov);
+        setTimeout(() => inp.focus(), 50);
+
+        const close = () => ov.remove();
+        const submit = () => {
+            if (inp.value === pwd) { close(); openSettingsUnlocked(); }
+            else { msg.textContent = 'Nesprávne heslo.'; inp.value = ''; inp.focus(); }
+        };
+        cancel.addEventListener('click', close);
+        ok.addEventListener('click', submit);
+        inp.addEventListener('keydown', (e) => { if (e.key === 'Enter') submit(); if (e.key === 'Escape') close(); });
+        ov.addEventListener('click', (e) => { if (e.target === ov) close(); });
+    }
+
+    function openSettingsUnlocked() {
         if (document.getElementById(OVERLAY_ID)) return;
         injectSettingsStyles();
 
@@ -2344,6 +2699,8 @@ body.${BODY_CLASS} #${PANEL_ID} .sapMPanelContent > :not(#${OVERVIEW_ID}) { disp
         const draftPdm = { ...settings.pdm };
         const draftExcel = { ...settings.excel };
         const draftGroups = { value: String(settings.groups || '') };
+        const draftButtons = buttonRules().map((r) => Object.assign({}, r));
+        const draftAdmin = Object.assign({ password: '123456', pickMode: false }, settings.admin || {});
 
         const overlay = document.createElement('div');
         overlay.id = OVERLAY_ID;
@@ -2539,6 +2896,91 @@ body.${BODY_CLASS} #${PANEL_ID} .sapMPanelContent > :not(#${OVERVIEW_ID}) { disp
         ioWrap.appendChild(ioBtns);
         body.appendChild(ioWrap);
 
+        // --- tlacidla: farby a nastavovanie pravym klikom ---
+        const hBtn = document.createElement('h3');
+        hBtn.textContent = 'Tlačidlá — farby';
+        body.appendChild(hBtn);
+
+        const pickRow = document.createElement('div');
+        pickRow.className = 'pda-mod';
+        const pickLbl = document.createElement('label');
+        pickLbl.style.cssText = 'display:flex;gap:11px;align-items:flex-start;cursor:pointer;';
+        const pickCb = document.createElement('input');
+        pickCb.type = 'checkbox';
+        pickCb.checked = !!draftAdmin.pickMode;
+        pickCb.addEventListener('change', () => { draftAdmin.pickMode = pickCb.checked; });
+        const pickTxt = document.createElement('div');
+        pickTxt.innerHTML = '<div class="nm">Nastavovanie tlačidiel pravým klikom</div>' +
+            '<div class="ds">Keď je zapnuté, pravý klik na ktorékoľvek tlačidlo v aplikácii ukáže paletu 12 farieb a „Reset tlačidla“. Výber sa hneď uloží. Po skončení to vypni, aby operátori omylom nemenili farby.</div>';
+        pickLbl.appendChild(pickCb); pickLbl.appendChild(pickTxt);
+        pickRow.appendChild(pickLbl);
+        body.appendChild(pickRow);
+
+        const btnWrap = document.createElement('div');
+        body.appendChild(btnWrap);
+
+        function renderButtons() {
+            btnWrap.innerHTML = '';
+            const table = document.createElement('table');
+            table.innerHTML = '<thead><tr><th>Text tlačidla</th><th style="width:150px">ID (ak nemá text)</th><th style="width:70px">Poradie</th><th style="width:110px">Pozadie</th><th style="width:90px">Text</th><th style="width:40px"></th></tr></thead>';
+            const tbody = document.createElement('tbody');
+            if (draftButtons.length === 0) {
+                const tr = document.createElement('tr');
+                const td = document.createElement('td');
+                td.colSpan = 6; td.className = 'pda-note'; td.style.padding = '6px 0';
+                td.textContent = 'Zatiaľ žiadne pravidlá. Zapni nastavovanie a klikni pravým na tlačidlo v aplikácii.';
+                tr.appendChild(td); tbody.appendChild(tr);
+            }
+            draftButtons.forEach((r, i) => {
+                const tr = document.createElement('tr');
+                const mk = (field, type, extra) => {
+                    const td = document.createElement('td');
+                    const inp = document.createElement('input');
+                    inp.type = type;
+                    if (type === 'number') { inp.step = '0.5'; inp.value = Number.isFinite(Number(r[field])) ? r[field] : 1.5; }
+                    else inp.value = r[field] || '';
+                    if (extra) extra(inp, td);
+                    inp.addEventListener('input', () => {
+                        draftButtons[i][field] = type === 'number' ? Number(inp.value) : inp.value.trim();
+                        if (field === 'bg') { draftButtons[i].fg = contrastColor(inp.value); renderButtons(); }
+                    });
+                    td.appendChild(inp);
+                    return td;
+                };
+                tr.appendChild(mk('text', 'text'));
+                tr.appendChild(mk('id', 'text'));
+                tr.appendChild(mk('poradie', 'number'));
+                tr.appendChild(mk('bg', 'color', (inp, td) => { const hex = document.createElement('span'); hex.style.cssText = 'font-size:.78rem;color:#6b7180;margin-left:6px;'; hex.textContent = r.bg || ''; td.appendChild(hex); }));
+                tr.appendChild(mk('fg', 'color'));
+                const tdDel = document.createElement('td');
+                const del = document.createElement('button');
+                del.type = 'button'; del.className = 'pda-del'; del.textContent = '×'; del.title = 'Odstrániť';
+                del.addEventListener('click', () => { draftButtons.splice(i, 1); renderButtons(); });
+                tdDel.appendChild(del);
+                tr.appendChild(tdDel);
+                tbody.appendChild(tr);
+            });
+            table.appendChild(tbody);
+            btnWrap.appendChild(table);
+
+            const tools = document.createElement('div');
+            tools.style.cssText = 'display:flex;gap:8px;flex-wrap:wrap;margin-top:4px;';
+            const add = document.createElement('button');
+            add.type = 'button'; add.className = 'pda-add'; add.style.marginTop = '0'; add.textContent = '+ Pridať tlačidlo';
+            add.addEventListener('click', () => { draftButtons.push({ text: '', id: '', bg: '#2563eb', fg: contrastColor('#2563eb'), poradie: 1.5 }); renderButtons(); });
+            const defaults = document.createElement('button');
+            defaults.type = 'button'; defaults.className = 'pda-add'; defaults.style.marginTop = '0'; defaults.textContent = 'Obnoviť predvolené farby';
+            defaults.addEventListener('click', () => { draftButtons.length = 0; DEFAULT_BUTTON_RULES.forEach((r) => draftButtons.push(Object.assign({}, r))); renderButtons(); });
+            tools.appendChild(add); tools.appendChild(defaults);
+            btnWrap.appendChild(tools);
+
+            const note = document.createElement('p');
+            note.className = 'pda-note';
+            note.textContent = 'Pravidlo sa hľadá podľa textu tlačidla (stačí časť textu), ID len keď tlačidlo text nemá. Poradie riadi zoradenie stavových tlačidiel na pracovisku (0 = prvé). Farba textu sa pri zmene pozadia dopočíta sama.';
+            btnWrap.appendChild(note);
+        }
+        renderButtons();
+
         // --- vykresy ---
         const hPdm = document.createElement('h3');
         hPdm.textContent = 'Služba výkresov (PDM)';
@@ -2629,6 +3071,124 @@ body.${BODY_CLASS} #${PANEL_ID} .sapMPanelContent > :not(#${OVERVIEW_ID}) { disp
         body.appendChild(colNote);
 
 
+        // --- subor s nastaveniami ---
+        const hFile = document.createElement('h3');
+        hFile.textContent = 'Súbor s nastaveniami (záloha a prenos na iný počítač)';
+        body.appendChild(hFile);
+
+        const fileInfo = document.createElement('div');
+        fileInfo.className = 'pda-note';
+        fileInfo.style.marginTop = '0';
+        fileInfo.textContent = 'Zisťujem…';
+        body.appendChild(fileInfo);
+
+        const fileMsg = document.createElement('div');
+        fileMsg.className = 'pda-note';
+        fileMsg.style.cssText = 'margin:4px 0 0;min-height:1.2em;color:#2f7d43;';
+
+        const fileRow = document.createElement('div');
+        fileRow.style.cssText = 'display:flex;gap:8px;flex-wrap:wrap;margin-top:8px;';
+        const mkBtn = (label, title) => {
+            const b = document.createElement('button');
+            b.type = 'button'; b.className = 'pda-add'; b.style.marginTop = '0'; b.textContent = label;
+            if (title) b.title = title;
+            fileRow.appendChild(b);
+            return b;
+        };
+        const bPick = mkBtn('Vybrať, kam sa má ukladať…', 'Systémové okno Uložiť ako — vyberieš miesto a názov súboru');
+        const bSave = mkBtn('Uložiť do súboru teraz');
+        const bLoad = mkBtn('Načítať zo súboru', 'Nahrá všetky nastavenia z vybraného súboru a obnoví stránku');
+        const bDown = mkBtn('Stiahnuť kópiu', 'Uloží kópiu do priečinka Stiahnuté súbory');
+        const bUp = mkBtn('Nahrať zo súboru…', 'Vyber .json súbor s nastaveniami');
+        const bForget = mkBtn('Zabudnúť súbor');
+        body.appendChild(fileRow);
+        body.appendChild(fileMsg);
+
+        const fileNote = document.createElement('p');
+        fileNote.className = 'pda-note';
+        fileNote.textContent = 'Po každom „Uložiť“ (aj po zmene farby pravým klikom) sa vybraný súbor prepíše. ' +
+            'Na inom počítači: „Nahrať zo súboru…“, alebo vyber ten istý súbor na sieťovom disku a daj „Načítať“. ' +
+            'Po reštarte Chromu môže prehliadač raz vyžiadať potvrdenie prístupu k súboru. ' +
+            'Súbor obsahuje aj osobné čísla používateľov — ulož ho tam, kam majú prístup len vedúci.';
+        body.appendChild(fileNote);
+
+        const upInput = document.createElement('input');
+        upInput.type = 'file'; upInput.accept = '.json,application/json'; upInput.style.display = 'none';
+        body.appendChild(upInput);
+
+        function fileSay(text, isError) { fileMsg.style.color = isError ? '#b0201a' : '#2f7d43'; fileMsg.textContent = text; }
+        function fileRefresh() {
+            SettingsFile.get().then((h) => {
+                if (h) fileInfo.textContent = 'Súbor: ' + h.name + ' — prepisuje sa po každom uložení.';
+                else fileInfo.textContent = SettingsFile.supported
+                    ? 'Zatiaľ nie je vybraný žiadny súbor. Klikni „Vybrať, kam sa má ukladať…“.'
+                    : 'Tento prehliadač nepodporuje výber miesta — použi „Stiahnuť kópiu“ a „Nahrať zo súboru…“.';
+                bPick.disabled = bSave.disabled = !SettingsFile.supported;
+                bForget.style.display = h ? '' : 'none';
+            });
+        }
+        fileRefresh();
+
+        bPick.addEventListener('click', () => {
+            pickSettingsFile().then((h) => { fileSay('Uložené do ' + h.name + '.'); fileRefresh(); })
+                .catch((e) => { if (!e || e.name !== 'AbortError') fileSay('Nepodarilo sa: ' + (e && e.message || e), true); });
+        });
+        bSave.addEventListener('click', () => {
+            SettingsFile.get().then((h) => {
+                if (!h) { fileSay('Najprv vyber, kam sa má ukladať.', true); return; }
+                return mirrorSettingsToFile(true).then((ok) => fileSay(ok ? 'Zapísané do ' + h.name + '.' : 'Zápis zlyhal — povoľ prístup k súboru.', !ok));
+            });
+        });
+        bLoad.addEventListener('click', () => {
+            (async () => {
+                let h = await SettingsFile.get();
+                if (!h) {
+                    if (typeof W.showOpenFilePicker !== 'function') { fileSay('Použi „Nahrať zo súboru…“.', true); return; }
+                    const picked = await W.showOpenFilePicker({ types: [{ description: 'Nastavenia PDA Suite', accept: { 'application/json': ['.json'] } }], multiple: false });
+                    h = picked[0];
+                    await SettingsFile.set(h);
+                }
+                const n = await loadSettingsFromHandle(h);
+                fileSay('Načítaných častí: ' + n + '. Obnovujem stránku…');
+                shared.intentionalReload = true;
+                setTimeout(() => location.reload(), 600);
+            })().catch((e) => { if (!e || e.name !== 'AbortError') fileSay('Načítanie zlyhalo: ' + (e && e.message || e), true); });
+        });
+        bDown.addEventListener('click', () => { downloadSettings(); fileSay('Kópia sa sťahuje.'); });
+        bUp.addEventListener('click', () => upInput.click());
+        upInput.addEventListener('change', () => {
+            const f = upInput.files && upInput.files[0];
+            if (!f) return;
+            f.text().then((txt) => {
+                const n = applySettingsObject(JSON.parse(txt));
+                fileSay('Nahraných častí: ' + n + '. Obnovujem stránku…');
+                shared.intentionalReload = true;
+                setTimeout(() => location.reload(), 600);
+            }).catch((e) => fileSay('Nahratie zlyhalo: ' + (e && e.message || e), true));
+        });
+        bForget.addEventListener('click', () => { SettingsFile.clear().then(() => { fileSay('Súbor zabudnutý (na disku ostáva).'); fileRefresh(); }); });
+
+        // --- heslo do nastaveni ---
+        const hPwd = document.createElement('h3');
+        hPwd.textContent = 'Heslo do nastavení';
+        body.appendChild(hPwd);
+        const pwdTable = document.createElement('table');
+        pwdTable.innerHTML = '<thead><tr><th>Heslo (pýta sa pri otvorení ozubeného kolieska)</th></tr></thead>';
+        const pwdBody = document.createElement('tbody');
+        const pwdTr = document.createElement('tr');
+        const pwdTd = document.createElement('td');
+        const pwdInp = document.createElement('input');
+        pwdInp.type = 'password';
+        pwdInp.autocomplete = 'new-password';
+        pwdInp.value = draftAdmin.password || '';
+        pwdInp.addEventListener('input', () => { draftAdmin.password = pwdInp.value; });
+        pwdTd.appendChild(pwdInp); pwdTr.appendChild(pwdTd); pwdBody.appendChild(pwdTr); pwdTable.appendChild(pwdBody);
+        body.appendChild(pwdTable);
+        const pwdNote = document.createElement('p');
+        pwdNote.className = 'pda-note';
+        pwdNote.textContent = 'Prázdne = bez hesla. Ukladá sa len lokálne v Tampermonkey na tomto počítači.';
+        body.appendChild(pwdNote);
+
         // --- paticka ---
         const foot = document.createElement('div');
         foot.className = 'pda-set-foot';
@@ -2669,9 +3229,13 @@ body.${BODY_CLASS} #${PANEL_ID} .sapMPanelContent > :not(#${OVERVIEW_ID}) { disp
             saveJson(KEY_PDM, draftPdm);
             saveJson(KEY_EXCEL, draftExcel);
             saveJson(KEY_GROUPS, draftGroups.value);
+            saveJson(KEY_BUTTONS, draftButtons.map(normalizeRule).filter((r) => r.text || r.id));
+            saveJson(KEY_ADMIN, { password: String(draftAdmin.password || ''), pickMode: !!draftAdmin.pickMode });
             close();
-            shared.intentionalReload = true;
-            location.reload();
+            mirrorSettingsToFile(true).then(() => {
+                shared.intentionalReload = true;
+                location.reload();
+            });
         });
     }
 
