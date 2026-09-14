@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PDA Suite (HF Slovakia)
 // @namespace    http://tampermonkey.net/
-// @version      1.5.0
+// @version      1.6.0
 // @description  Vsetky vylepsenia PDA v jednom skripte + panel na zapinanie a vypinanie jednotlivych modulov
 // @author       Gabris, Tvarozek
 // @updateURL    https://github.com/JaroTvarozek/HF-PDA-scripts/raw/refs/heads/main/pda-suite.user.js
@@ -1125,24 +1125,61 @@
          * Preto sa obe strany prevedu na rovnaky tvar: bez apostrofu, bez
          * medzier a bez uvodnych nul.
          */
+        // '001600108008' aj "'1600108008" -> '1600108008' (len cislice, bez uvodnych nul)
         function normalizeOrderKey(value) {
             return String(value === undefined || value === null ? '' : value)
-                .trim()
-                .replace(/^'+/, '')
-                .replace(/\s+/g, '')
+                .replace(/\D/g, '')
                 .replace(/^0+/, '');
         }
 
+        // Stlpce sa hladaju podla NAZVU v hlavicke (AutomatedOQ180.xlsx ich ma
+        // stale rovnake), pismena z nastaveni su len zaloha pre iny subor.
+        const HEADER_NAMES = {
+            order: 'production order number',
+            drawing: 'document number (material of production order)',
+            version: 'document version (material of production order)',
+            material: 'material number (production order)',
+        };
+
+        // 'SIEHE DIS', 'B.V.', 'O.Z.' nie su cisla vykresov - cislo vykresu ma vzdy cislicu
+        function isDrawingNo(v) {
+            return /\d/.test(String(v || ''));
+        }
+
+        function cellText(row, col) {
+            if (col < 0 || row[col] === undefined || row[col] === null) return '';
+            return String(row[col]).trim().replace(/^'+/, '');
+        }
+
+        function findColumns(headerRow) {
+            const hdr = (headerRow || []).map((h) => String(h === undefined || h === null ? '' : h).trim().toLowerCase());
+            const cols = {
+                order: hdr.indexOf(HEADER_NAMES.order),
+                drawing: hdr.indexOf(HEADER_NAMES.drawing),
+                version: hdr.indexOf(HEADER_NAMES.version),
+                material: hdr.indexOf(HEADER_NAMES.material),
+            };
+            if (cols.order === -1 || cols.drawing === -1) {
+                console.log(LOG, 'Excel: hlavičky stĺpcov sa nenašli, používam písmená z nastavení');
+                return { order: COL_ORDER_NO, drawing: COL_DRAWING_NO, version: COL_VERSION, material: -1 };
+            }
+            return cols;
+        }
+
         function buildDrawingIndex(rows) {
+            const cols = findColumns(rows[0]);
             const index = {};
             for (let i = 1; i < rows.length; i++) {
                 const row = rows[i];
                 if (!row) continue;
-                const key = normalizeOrderKey(row[COL_ORDER_NO]);
-                if (!key) continue;
+                const key = normalizeOrderKey(row[cols.order]);
+                if (!key || index[key]) continue;   // prvy vyskyt vyhrava (v Python verzii overene: 0 konfliktov)
+                const vyk = cellText(row, cols.drawing);
+                const valid = isDrawingNo(vyk);
                 index[key] = {
-                    drawingNo: row[COL_DRAWING_NO] != null ? String(row[COL_DRAWING_NO]).trim() : '',
-                    version: row[COL_VERSION] != null ? String(row[COL_VERSION]).trim() : '',
+                    drawingNo: valid ? vyk : '',
+                    version: valid ? cellText(row, cols.version) : '',
+                    materialNo: cellText(row, cols.material).replace(/^0+/, ''),
                 };
             }
             return index;
@@ -1258,21 +1295,45 @@
 
         // --- napojenie na aktualne otvorenu operaciu ---
 
-        XhrBus.subscribe((ev) => {
-            const op = ev.response && ev.response.result && ev.response.result.operation;
-            if (!op) return;
-            shared.currentOperation = {
-                workcenter: op.workcenterDescription,
-                workcenterCode: op.workcenter,
-                productionOrderNo: op.productionOrderNo,
-                salesOrderNo: op.salesOrderNo,
-                operationNo: op.operationNo,
-                sequenceNo: op.sequenceNo,
-                materialNo: op.materialNo,
-                material: op.material,
-            };
-            applyForOperation(shared.currentOperation);
-        });
+        /*
+         * Prave otvorena operacia sa cita priamo z premennej appky
+         * getGlobals().getVar('oSelectedWorkcenterOperation') - rovnako ako v
+         * Python verzii. Povodne odpocuvanie siete cakalo na result.operation,
+         * ktore appka neposiela spolahlivo, preto tlacidlo ostavalo prazdne.
+         */
+        function readSelectedOperation() {
+            try {
+                const main = W.sap.ui.getCore().byId('Main');
+                const op = main && main.getController().getGlobals().getVar('oSelectedWorkcenterOperation');
+                if (!op || !op.productionOrderNo) return null;
+                return {
+                    workcenter: op.workcenterDescription,
+                    workcenterCode: op.workcenter,
+                    productionOrderNo: String(op.productionOrderNo || ''),
+                    salesOrderNo: String(op.salesOrderNo || ''),
+                    operationNo: String(op.operationNo || ''),
+                    sequenceNo: op.sequenceNo,
+                    materialNo: String(op.materialNo || '').replace(/^0+/, ''),
+                    material: op.material,
+                };
+            } catch (e) {
+                return null;
+            }
+        }
+
+        let lastOperationKey = null;
+
+        function pollSelectedOperation() {
+            const cur = readSelectedOperation();
+            const key = cur ? cur.productionOrderNo + '|' + cur.operationNo + '|' + cur.sequenceNo : '';
+            if (key === lastOperationKey) return;
+            lastOperationKey = key;
+            shared.currentOperation = cur;
+            if (cur) applyForOperation(cur);
+            else updateDisplay(null);
+        }
+
+        onReady(() => setInterval(pollSelectedOperation, 500));
 
         function stripLeadingApostrophe(value) {
             if (!value) return value;
@@ -1324,7 +1385,8 @@
                 return;
             }
 
-            const material = String(current.materialNo || '').trim();
+            // material: najprv z Excelu (ak zakazku pozna, ale vykres tam nema), inak z operacie
+            const material = ((fromExcel && fromExcel.materialNo) || String(current.materialNo || '')).trim();
             if (!material) { updateDisplay(null); return; }
 
             updateDisplay({ drawingNo: '…', version: '', searchTerm: material, source: 'hladam' });
@@ -1399,7 +1461,23 @@
             });
         }
 
-        function pdmOpenDialog(cislo, { path = '' } = {}) {
+        /*
+         * Zhoda revizie z Excelu s reviziou v nazve suboru - rovnake pravidlo ako
+         * v sluzbe (Python verzia): pismeno musi sediet, index len ak ho poznaju
+         * obaja. 'BC' ~ 'C' ano, 'BC' ~ 'B' nie, '0A' ~ 'A' ano.
+         */
+        function revisionMatches(label, rev) {
+            label = String(label || '').toUpperCase();
+            rev = String(rev || '').toUpperCase();
+            if (!label || !rev || label === 'BEZ REV.') return false;
+            const l1 = label.slice(-1), i1 = label.length > 1 ? label.slice(0, -1) : '';
+            const l2 = rev.slice(-1), i2 = rev.length > 1 ? rev.slice(0, -1) : '';
+            return l1 === l2 && (!i1 || !i2 || i1 === i2);
+        }
+
+        // Hlada sa LEN podla cisla vykresu (bez revizie); revizia z Excelu sa
+        // v zozname iba zvyrazni, rozhodnutie ostava na cloveku.
+        function pdmOpenDialog(cislo, { path = '', rev = '' } = {}) {
             const overlay = document.createElement('div');
             overlay.id = '__pda_pdm_overlay__';
             overlay.style.cssText =
@@ -1443,13 +1521,20 @@
                         return;
                     }
 
+                    // zhoda revizie: primarne zo sluzby (pocita ju zo SAP verzie), inak lokalne z Excelu
+                    const rows = (d.vysledky || []).map((v) => {
+                        const known = v.zhoda_revizie === true || v.zhoda_revizie === false;
+                        return Object.assign({}, v, { zhoda: known ? v.zhoda_revizie : (rev ? revisionMatches(v.revizia, rev) : null) });
+                    });
+                    rows.sort((a, b) => ((b.zhoda === true) - (a.zhoda === true)) || String(a.nazov).localeCompare(String(b.nazov)));
+
                     telo.innerHTML =
                         '<table style="width:100%;border-collapse:collapse;font-size:14px"><thead><tr>' +
                         '<th ' + TH + '>Názov</th><th ' + TH + '>Revízia</th>' +
                         '<th ' + TH + '>Stav</th><th ' + TH + '>Ver.</th>' +
                         '</tr></thead><tbody>' +
-                        d.vysledky.map((v) => {
-                            const bg = v.zhoda_revizie === true ? '#e6f4ea' : (v.v_zakazke ? '#f3f7fd' : 'transparent');
+                        rows.map((v) => {
+                            const bg = v.zhoda === true ? '#e6f4ea' : (v.v_zakazke ? '#f3f7fd' : 'transparent');
                             const mark = v.v_zakazke ? ' <span style="font-size:10px;color:#2f6fbf;border:1px solid #b9cbe8;border-radius:9px;padding:1px 6px">v zákazke</span>' : '';
                             return '<tr data-id="' + v.id + '" style="cursor:pointer;background:' + bg + '">' +
                                 '<td ' + TD + '><b>' + v.nazov + '</b>' + mark + '</td>' +
@@ -1549,7 +1634,10 @@
 
                 // ak uz vieme cislo vykresu (alebo aspon material), hladame podla neho
                 if (currentDrawingInfo && currentDrawingInfo.searchTerm) {
-                    pdmOpenDialog(currentDrawingInfo.searchTerm, { path });
+                    pdmOpenDialog(currentDrawingInfo.searchTerm, {
+                        path,
+                        rev: currentDrawingInfo.source === 'excel' ? currentDrawingInfo.version : '',
+                    });
                     return;
                 }
                 // inak skusime aspon cislo materialu z otvorenej operacie
@@ -1584,84 +1672,127 @@
 
     /* ------------------ 3.8 Prehlad pracovisk (uvodna) ------------------ */
 
+    /*
+     * Portovane z Python appky (Temporary/PDA/app/pda_action.py, blok OBLASTI).
+     * Rozdiel oproti prvej verzii tohto modulu:
+     *  - data sa NEcitaju zo siete ani z DOM, ale priamo z premennej appky
+     *    getGlobals().getVar('aWorkcenterOperationLists')
+     *  - kategoria = pole `area` (Assembly / Welding / Machining / Quality Control)
+     *  - "vyraba" = pole `count` > 0 (kolko ludi je prihlasenych na pracovisku)
+     *  - klik na stroj vola ten isty handler, aky vola appka pri kliku na kartu
+     *  - povodne karty sa skryju jednym CSS pravidlom, v DOM ostavaju
+     */
     function modWorkcenterOverview() {
-        const TILE_SELECTOR = '[id^="Main--Workcenter_Toolbar-Main--ui_layout_Grid3-"]';
-        const TILE_ID_PREFIX = 'Main--Workcenter_Toolbar-';
-        const HOME_BUTTON_ID = 'Main--Button_HomeScreen';
         const OVERVIEW_ID = '__pda_overview__';
         const STYLE_ID = '__pda_overview_styles__';
+        const BODY_CLASS = 'pda-overview-on';
+        const HOME_BUTTON_ID = 'Main--Button_HomeScreen';
+        const PANEL_ID = 'Main--Workcenter_Panel';
+        const ORDER = ['Assembly', 'Welding', 'Machining', 'Quality Control'];
+        const SUBTITLES = {
+            'Assembly': 'Finálna montáž a podzostavy',
+            'Welding': 'Zváranie a príprava',
+            'Machining': 'CNC a konvenčné obrábanie',
+            'Quality Control': 'Kontrola a meranie',
+            'Ostatné': 'Nezaradené pracoviská',
+        };
+        const ICONS = { 'Assembly': '🔧', 'Welding': '🔥', 'Machining': '⚙', 'Quality Control': '🔎' };
 
-        const expanded = new Set();   // nazvy rozbalenych kategorii
-        const filters = {};           // hladanie a filter pre kazdu kategoriu
+        const expanded = new Set();   // rozbalene kategorie
+        const filters = {};           // { q, only } pre kazdu kategoriu
         let lastSignature = null;
-        let wcByName = {};            // popis pracoviska -> { code }
 
-        let groupField = null; // nazov pola v datach, ktore sluzi ako kategoria
-
-        /*
-         * Kategoria pracoviska sa berie priamo z dat, nie z nastaveni.
-         * Medzi polami workcenteru sa hlada take, ktore sa sprava ako
-         * ciselnik: ma malo roznych hodnot, ale viac ako jednu, a je
-         * vyplnene takmer vsade. Cislo a nazov pracoviska su unikatne,
-         * takze do vyberu nepadnu.
-         */
-        function detectGroupField(list) {
-            const IGNORE = ['workcenter', 'workcenterDescription', 'operationList'];
-            const stats = {};
-
-            list.forEach((wc) => {
-                Object.keys(wc).forEach((k) => {
-                    if (IGNORE.indexOf(k) !== -1) return;
-                    const v = wc[k];
-                    if (typeof v !== 'string' && typeof v !== 'number') return;
-                    const s = String(v).trim();
-                    if (!s) return;
-                    if (!stats[k]) stats[k] = { values: new Set(), filled: 0 };
-                    stats[k].values.add(s);
-                    stats[k].filled++;
-                });
-            });
-
-            const maxDistinct = Math.max(12, Math.floor(list.length / 5));
-            const candidates = Object.keys(stats).map((k) => ({
-                key: k,
-                distinct: stats[k].values.size,
-                coverage: stats[k].filled / list.length,
-                sample: Array.from(stats[k].values).slice(0, 6),
-            })).filter((c) => c.distinct >= 2 && c.distinct <= maxDistinct && c.coverage >= 0.8);
-
-            candidates.sort((a, b) => (b.coverage - a.coverage) || (a.distinct - b.distinct));
-
-            console.log(LOG, 'polia vhodné ako kategória pracoviska:',
-                candidates.length
-                    ? candidates.map((c) => c.key + ' (' + c.distinct + ' hodnôt: ' + c.sample.join(', ') + ')')
-                    : 'žiadne — použijú sa vzory z nastavení');
-
-            return candidates[0] || null;
+        function globals() {
+            try {
+                const main = W.sap.ui.getCore().byId('Main');
+                return main ? main.getController().getGlobals() : null;
+            } catch (e) { return null; }
         }
 
-        XhrBus.subscribe((ev) => {
-            if (!ev.request || ev.request.BOMethod !== 'getOperationListTempForWorkcenters') return;
-            const list = ev.response && ev.response.result && ev.response.result.aOperationListTempForWorkcenter;
-            if (!list || !list.length) return;
+        function workcenterList() {
+            const g = globals();
+            if (!g) return [];
+            try { return g.getVar('aWorkcenterOperationLists') || []; } catch (e) { return []; }
+        }
 
-            const map = {};
-            list.forEach((wc) => {
-                if (wc.workcenterDescription) map[wc.workcenterDescription] = wc;
-            });
-            wcByName = map;
+        function userName() {
+            const g = globals();
+            try {
+                const n = g && g.getVar('oUser', 'username');
+                if (n) return String(n);
+            } catch (e) { /* ignore */ }
+            const el = document.querySelector('[id$="Label_Username-bdi"]');
+            return el ? el.textContent.trim() : '';
+        }
 
-            groupField = detectGroupField(list);
-            console.log(LOG, 'kategórie pracovísk sa berú z poľa:', groupField ? groupField.key : '(vzory z nastavení)');
+        function normalize(s) {
+            return String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toUpperCase();
+        }
 
-            lastSignature = null; // vynuti prekreslenie s doplnenymi udajmi
-        });
+        /*
+         * Otvorenie pracoviska presne tak, ako to robi appka po kliku na kartu
+         * (handler f_cards_Header3_press). V Python verzii sa zistilo, ze handler
+         * po navTo nedobehne - texty casov ostanu prazdne a potvrdzovacie tlacidla
+         * zapnute - preto sa to po 1,5 s dorobi rovnako, ako to robi appka.
+         */
+        function openWorkcenter(wc) {
+            try {
+                const core = W.sap.ui.getCore();
+                const main = core.byId('Main').getController();
+                const g = main.getGlobals();
+                const app = core.byId('Application');
+
+                if (app && app.getCurrentPage && String(app.getCurrentPage().getId()).indexOf('WorkcenterDetail') === 0) {
+                    main.navTo('Main', 'show');
+                }
+                if (!g.getVar('oSelectedWorkcenterOperation')) g.setVar('oSelectedWorkcenterOperation', {});
+
+                const ctx = { getObject: () => wc };
+                const src = { getParent: () => ({ getBindingContext: () => ctx }) };
+                main.f_cards_Header3_press({ getSource: () => src });
+
+                setTimeout(() => {
+                    try {
+                        const op = g.getVar('oSelectedWorkcenterOperation') || {};
+                        [['SetupTime_Text', 'setupTimeConf', 'setupTime'],
+                         ['MachineTime_Text', 'machineTimeConf', 'machineTime'],
+                         ['LaborTime_Text', 'laborTimeConf', 'laborTime']].forEach(([id, conf, plan]) => {
+                            const e = core.byId('WorkcenterDetail--' + id);
+                            if (e && typeof e.setText === 'function') {
+                                e.setText(op.id ? op[conf] + ' / ' + op[plan] + ' min' : '- / - min');
+                            }
+                        });
+                        if (!op.id) {
+                            main.setItemValue('WorkcenterDetail', 'Part_Confirm_Button', 'enabled', false);
+                            main.setItemValue('WorkcenterDetail', 'Confirm_Button', 'enabled', false);
+                        }
+                    } catch (e) { /* kozmetika, nie je kriticka */ }
+                }, 1500);
+            } catch (e) {
+                console.warn(LOG, 'otvorenie pracoviska cez handler zlyhalo, skúšam klik na kartu', e);
+                const tile = findTile(wc);
+                if (tile) pressElement(tile);
+            }
+        }
+
+        // zaloha: povodna karta v DOM podla nazvu pracoviska
+        function findTile(wc) {
+            const want = String(wc.workcenterDescription || '').trim();
+            const tiles = document.querySelectorAll('[id^="Main--Workcenter_Toolbar-Main--ui_layout_Grid3-"]');
+            for (const t of tiles) {
+                const suffix = t.id.replace('Main--Workcenter_Toolbar-', '');
+                const el = document.getElementById('Main--WorkcenterDescription_Label-' + suffix + '-bdi');
+                if (el && el.textContent.trim() === want) return t;
+            }
+            return null;
+        }
 
         function injectStyles() {
             if (document.getElementById(STYLE_ID)) return;
             const st = document.createElement('style');
             st.id = STYLE_ID;
             st.textContent = `
+body.${BODY_CLASS} #${PANEL_ID} .sapMPanelContent > :not(#${OVERVIEW_ID}) { display: none !important; }
 #${OVERVIEW_ID} { font: 14px/1.5 -apple-system,"Segoe UI",Roboto,sans-serif; color:#1a2233; padding: 4px 0 10px; }
 #${OVERVIEW_ID} .ov-hi { padding: 4px 6px 14px; }
 #${OVERVIEW_ID} .ov-hi .k { font-size:.68rem; letter-spacing:.12em; color:#5b7cb5; font-weight:700; }
@@ -1696,155 +1827,124 @@
 #${OVERVIEW_ID} .ov-txt { display:flex; flex-direction:column; min-width:0; }
 #${OVERVIEW_ID} .ov-txt small { font-size:.71rem; color:#6b7180; line-height:1.3;
   white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-#${OVERVIEW_ID} .ov-st { display:flex; align-items:center; gap:5px; font-size:.76rem; color:#6b7180; white-space:nowrap; }
-#${OVERVIEW_ID} .ov-dot { width:7px; height:7px; border-radius:50%; background:#9fb4d4; flex-shrink:0; }
-#${OVERVIEW_ID} .ov-chip.run .ov-dot { background:#2f9e44; }
-#${OVERVIEW_ID} .ov-chip.run .ov-st { color:#2f7d43; font-weight:600; }
+#${OVERVIEW_ID} .ov-st { display:flex; align-items:center; gap:5px; font-size:.76rem; color:#1e40af;
+  background:#e8f0fe; border-radius:999px; padding:3px 9px; white-space:nowrap; font-weight:600; }
+#${OVERVIEW_ID} .ov-dot { width:7px; height:7px; border-radius:50%; background:#2563eb; flex-shrink:0; }
+#${OVERVIEW_ID} .ov-chip.run .ov-st { color:#166534; background:#eaf6ee; }
+#${OVERVIEW_ID} .ov-chip.run .ov-dot { background:#16a34a; }
 #${OVERVIEW_ID} .ov-empty { color:#8b93a3; font-size:.85rem; padding:8px 2px; }
 `;
             document.head.appendChild(st);
         }
 
-        function normalize(s) {
-            // bez diakritiky a velkymi pismenami, aby "ZVÁR" naslo aj "ZVAR"
-            return String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toUpperCase();
-        }
+        function chip(w) {
+            const producing = (w.count || 0) > 0;
+            const code = String(w.workcenter || '');
+            const name = String(w.workcenterDescription || '');
 
-        function parseGroups() {
-            return String(settings.groups || '')
-                .split('\n')
-                .map((line) => line.trim())
-                .filter(Boolean)
-                .map((line) => {
-                    const parts = line.split('|');
-                    return {
-                        name: (parts[0] || '').trim(),
-                        subtitle: (parts[1] || '').trim(),
-                        patterns: (parts[2] || '').split(',').map((p) => normalize(p.trim())).filter(Boolean),
-                    };
-                })
-                .filter((g) => g.name);
-        }
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'ov-chip' + (producing ? ' run' : '');
+            btn.title = code + ' — ' + name;
 
-        function getTileName(tile) {
-            const suffix = tile.id.replace(TILE_ID_PREFIX, '');
-            const el = document.getElementById('Main--WorkcenterDescription_Label-' + suffix + '-bdi');
-            return el ? el.textContent.trim() : '';
-        }
-
-        // Pocet prihlasenych ludi na pracovisku. Hlada kratke cislo v hlavicke
-        // dlazdice - teda mimo zoznamu operacii, ktory ma vlastne pocty.
-        function readOnlineCount(tile) {
-            const suffix = tile.id.replace(TILE_ID_PREFIX, '');
-            const descEl = document.getElementById('Main--WorkcenterDescription_Label-' + suffix + '-bdi');
-            const opList = tile.querySelector('[id^="Main--List2-"]');
-
-            const candidates = Array.from(tile.querySelectorAll('bdi'));
-            let seenDesc = !descEl;
-            for (const el of candidates) {
-                if (el === descEl) { seenDesc = true; continue; }
-                if (!seenDesc) continue;
-                if (opList && opList.contains(el)) break; // dalej uz je zoznam operacii
-                const txt = (el.textContent || '').trim();
-                if (/^\d{1,3}$/.test(txt)) return parseInt(txt, 10);
+            const txt = document.createElement('span');
+            txt.className = 'ov-txt';
+            const label = document.createElement('b');
+            label.textContent = code || name;
+            txt.appendChild(label);
+            if (code && name) {
+                const sub = document.createElement('small');
+                sub.textContent = name.length > 20 ? name.slice(0, 20).trim() + '…' : name;
+                txt.appendChild(sub);
             }
-            return null;
+
+            const st = document.createElement('span');
+            st.className = 'ov-st';
+            const dot = document.createElement('span');
+            dot.className = 'ov-dot';
+            st.appendChild(dot);
+            st.appendChild(document.createTextNode(producing ? 'Vyrába' : 'Nevyrába'));
+
+            btn.appendChild(txt);
+            btn.appendChild(st);
+            btn.addEventListener('click', () => openWorkcenter(w));
+            return btn;
         }
 
-        function collectTiles() {
-            return Array.from(document.querySelectorAll(TILE_SELECTOR)).map((tile) => {
-                const name = getTileName(tile);
-                const online = readOnlineCount(tile);
-                const wc = wcByName[name];
-                return {
-                    tile,
-                    name,
-                    code: wc ? String(wc.workcenter || '') : '',
-                    // kategoria priamo z dat, ak sa take pole naslo
-                    group: wc && groupField ? String(wc[groupField.key] || '').trim() : '',
-                    online: online === null ? 0 : online,
-                    onlineKnown: online !== null,
-                };
-            }).filter((t) => t.name);
-        }
+        function groupBody(groupName, items) {
+            const state = filters[groupName] || (filters[groupName] = { q: '', only: 'all' });
 
-        function groupOf(entry, groups) {
-            const hay = normalize(entry.code + ' ' + entry.name);
-            for (const g of groups) {
-                if (g.patterns.some((p) => hay.indexOf(p) !== -1)) return g.name;
-            }
-            return 'Ostatné';
-        }
+            const body = document.createElement('div');
+            body.className = 'ov-gb';
 
-        function buildGroups(entries) {
-            const buckets = new Map();
-            const fromData = entries.some((e) => e.group);
+            const tools = document.createElement('div');
+            tools.className = 'ov-tools';
+            const q = document.createElement('input');
+            q.type = 'search';
+            q.placeholder = 'Hľadať pracovisko…';
+            q.value = state.q;
+            const sel = document.createElement('select');
+            sel.innerHTML = '<option value="all">Všetky</option><option value="run">Vyrába</option><option value="idle">Nevyrába</option>';
+            sel.value = state.only;
+            tools.appendChild(q);
+            tools.appendChild(sel);
 
-            if (fromData) {
-                // kategorie priamo z dat - ziadne vzory, ziadne nastavovanie
-                entries.forEach((e) => {
-                    const name = e.group || 'Ostatné';
-                    if (!buckets.has(name)) {
-                        buckets.set(name, {
-                            def: { name, subtitle: groupField ? 'podľa poľa ' + groupField.key : '' },
-                            items: [],
-                        });
-                    }
-                    buckets.get(name).items.push(e);
+            const chips = document.createElement('div');
+            chips.className = 'ov-chips';
+
+            function paint() {
+                chips.innerHTML = '';
+                const needle = normalize(state.q);
+                const shown = items.filter((w) => {
+                    const producing = (w.count || 0) > 0;
+                    if (state.only === 'run' && !producing) return false;
+                    if (state.only === 'idle' && producing) return false;
+                    if (!needle) return true;
+                    return normalize(w.workcenter + ' ' + w.workcenterDescription).indexOf(needle) !== -1;
                 });
-                return Array.from(buckets.values())
-                    .filter((b) => b.items.length > 0)
-                    .sort((a, b) => b.items.length - a.items.length);
+                if (shown.length === 0) {
+                    const empty = document.createElement('div');
+                    empty.className = 'ov-empty';
+                    empty.textContent = 'Nič nezodpovedá zadaniu.';
+                    chips.appendChild(empty);
+                    return;
+                }
+                shown.forEach((w) => chips.appendChild(chip(w)));
             }
 
-            // zaloha, ak sa v datach nic vhodne nenaslo
-            const defs = parseGroups();
-            defs.forEach((g) => buckets.set(g.name, { def: g, items: [] }));
-            entries.forEach((e) => {
-                const name = groupOf(e, defs);
-                if (!buckets.has(name)) {
-                    buckets.set(name, { def: { name, subtitle: 'Nezaradené pracoviská', patterns: [] }, items: [] });
-                }
-                buckets.get(name).items.push(e);
-            });
-            return Array.from(buckets.values()).filter((b) => b.items.length > 0);
+            q.addEventListener('input', () => { state.q = q.value; paint(); });
+            q.addEventListener('click', (e) => e.stopPropagation());
+            sel.addEventListener('change', () => { state.only = sel.value; paint(); });
+
+            body.appendChild(tools);
+            body.appendChild(chips);
+            paint();
+            return body;
         }
 
-        // ikona sa hada z nazvu kategorie, lebo nazvy prichadzaju z dat
-        const ICON_RULES = [
-            [/ZVAR|WELD|TIG|MIG/, '🔥'],
-            [/MONTAZ|MONT|ASSEMBL/, '🔧'],
-            [/CNC|MACHIN|OBRAB|FREZ|SUSTR|BRUS/, '⚙'],
-            [/OTK|KONTROL|MERAN|QUALIT|KVALIT/, '🔎'],
-            [/LAK|FARB|PAINT/, '🎨'],
-            [/PEC|ZIHA|KALEN|HEAT/, '🌡'],
-            [/SKLAD|LOGIST|EXPED/, '📦'],
-        ];
-
-        function iconFor(name) {
-            const n = normalize(name);
-            for (const [re, icon] of ICON_RULES) if (re.test(n)) return icon;
-            return '🏭';
-        }
-
-        function render(host, entries) {
+        function render(host, list) {
             host.innerHTML = '';
-            injectStyles();
 
-            const userEl = document.querySelector('[id$="Label_Username-bdi"]');
             const hi = document.createElement('div');
             hi.className = 'ov-hi';
-            hi.innerHTML =
-                '<div class="k">VITAJTE SPÄŤ</div>' +
-                '<div class="n"></div>' +
+            hi.innerHTML = '<div class="k">VITAJTE SPÄŤ</div><div class="n"></div>' +
                 '<div class="s">Vyberte pracovisko a začnite pracovať.</div>';
-            hi.querySelector('.n').textContent = userEl ? userEl.textContent.trim() : 'Pracoviská';
+            hi.querySelector('.n').textContent = userName() || 'Pracoviská';
             host.appendChild(hi);
 
-            buildGroups(entries).forEach((bucket) => {
-                const gName = bucket.def.name;
+            // zoskupenie podla pola `area`; co ho nema, ide do "Ostatne"
+            const groups = {};
+            list.forEach((w) => {
+                const key = w.area || 'Ostatné';
+                (groups[key] = groups[key] || []).push(w);
+            });
+            const order = ORDER.filter((g) => groups[g])
+                .concat(Object.keys(groups).filter((g) => ORDER.indexOf(g) === -1).sort());
+
+            order.forEach((gName) => {
+                const items = groups[gName].slice().sort((a, b) => String(a.workcenter).localeCompare(String(b.workcenter)));
+                const online = items.reduce((acc, w) => acc + (w.count || 0), 0);
                 const isOpen = expanded.has(gName);
-                const onlineCount = bucket.items.filter((i) => i.online > 0).length;
 
                 const box = document.createElement('div');
                 box.className = 'ov-g' + (isOpen ? ' open' : '');
@@ -1853,155 +1953,59 @@
                 head.type = 'button';
                 head.className = 'ov-gh';
                 head.innerHTML =
-                    '<div class="ov-ic">' + iconFor(gName) + '</div>' +
+                    '<div class="ov-ic">' + (ICONS[gName] || '🏭') + '</div>' +
                     '<div class="ov-gt"><b></b><span></span></div>' +
-                    '<div class="ov-num"><b>' + bucket.items.length + '</b><span>PRACOVÍSK</span></div>' +
-                    '<div class="ov-num on"><b>' + onlineCount + '</b><span>ONLINE</span></div>' +
+                    '<div class="ov-num"><b>' + items.length + '</b><span>PRACOVÍSK</span></div>' +
+                    '<div class="ov-num on"><b>' + online + '</b><span>ONLINE</span></div>' +
                     '<div class="ov-ch">' + (isOpen ? '⌄' : '›') + '</div>';
                 head.querySelector('.ov-gt b').textContent = gName;
-                head.querySelector('.ov-gt span').textContent = bucket.def.subtitle || '';
+                head.querySelector('.ov-gt span').textContent = SUBTITLES[gName] || '';
                 head.addEventListener('click', () => {
-                    if (expanded.has(gName)) expanded.delete(gName);
-                    else expanded.add(gName);
+                    if (expanded.has(gName)) expanded.delete(gName); else expanded.add(gName);
                     lastSignature = null;
-                    render(host, collectTiles());
+                    ensureOverview();
                 });
                 box.appendChild(head);
-
-                if (isOpen) {
-                    const body = document.createElement('div');
-                    body.className = 'ov-gb';
-
-                    const state = filters[gName] || (filters[gName] = { q: '', only: 'all' });
-
-                    const tools = document.createElement('div');
-                    tools.className = 'ov-tools';
-
-                    const q = document.createElement('input');
-                    q.type = 'search';
-                    q.placeholder = 'Hľadať pracovisko…';
-                    q.value = state.q;
-
-                    const sel = document.createElement('select');
-                    sel.innerHTML = '<option value="all">Všetky</option><option value="run">Iba vo výrobe</option>';
-                    sel.value = state.only;
-
-                    const chips = document.createElement('div');
-                    chips.className = 'ov-chips';
-
-                    function paintChips() {
-                        chips.innerHTML = '';
-                        const needle = normalize(state.q);
-                        const shown = bucket.items.filter((it) => {
-                            if (state.only === 'run' && !(it.online > 0)) return false;
-                            if (!needle) return true;
-                            return normalize(it.code + ' ' + it.name).indexOf(needle) !== -1;
-                        });
-
-                        if (shown.length === 0) {
-                            const empty = document.createElement('div');
-                            empty.className = 'ov-empty';
-                            empty.textContent = 'Nič nezodpovedá zadaniu.';
-                            chips.appendChild(empty);
-                            return;
-                        }
-
-                        shown.forEach((it) => {
-                            const chip = document.createElement('button');
-                            chip.type = 'button';
-                            chip.className = 'ov-chip' + (it.online > 0 ? ' run' : '');
-                            chip.title = (it.code ? it.code + ' — ' : '') + it.name;
-
-                            const txt = document.createElement('span');
-                            txt.className = 'ov-txt';
-
-                            const label = document.createElement('b');
-                            label.textContent = it.code || it.name;
-                            txt.appendChild(label);
-
-                            // druhy riadok: nazov pracoviska, skrateny
-                            if (it.code && it.name) {
-                                const sub = document.createElement('small');
-                                sub.textContent = it.name.length > 20 ? it.name.slice(0, 20).trim() + '…' : it.name;
-                                txt.appendChild(sub);
-                            }
-
-                            const st = document.createElement('span');
-                            st.className = 'ov-st';
-                            const dot = document.createElement('span');
-                            dot.className = 'ov-dot';
-                            st.appendChild(dot);
-                            st.appendChild(document.createTextNode(
-                                it.onlineKnown ? (it.online > 0 ? 'Výroba' : 'Nevýroba') : 'Otvoriť'
-                            ));
-
-                            chip.appendChild(txt);
-                            chip.appendChild(st);
-                            chip.addEventListener('click', () => pressElement(it.tile));
-                            chips.appendChild(chip);
-                        });
-                    }
-
-                    q.addEventListener('input', () => { state.q = q.value; paintChips(); });
-                    sel.addEventListener('change', () => { state.only = sel.value; paintChips(); });
-
-                    tools.appendChild(q);
-                    tools.appendChild(sel);
-                    body.appendChild(tools);
-                    body.appendChild(chips);
-                    box.appendChild(body);
-                    paintChips();
-                }
-
+                if (isOpen) box.appendChild(groupBody(gName, items));
                 host.appendChild(box);
             });
         }
 
-        /*
-         * Najde najblizsieho spolocneho rodica vsetkych dlazdic.
-         * Kazda dlazdica ma vlastny obal (bunka UI5 mriezky), takze skryt
-         * tiles[0].parentElement by skrylo iba jednu dlazdicu - treba ist
-         * vyssie, az k celej mriezke.
-         */
-        function commonAncestor(nodes) {
-            if (nodes.length === 0) return null;
-            let anc = nodes[0].parentElement;
-            while (anc && !nodes.every((n) => anc.contains(n))) anc = anc.parentElement;
-            return anc;
-        }
-
         function ensureOverview() {
-            // len na uvodnej obrazovke
-            if (!document.getElementById(HOME_BUTTON_ID)) return;
+            if (!document.getElementById(HOME_BUTTON_ID)) return;   // len uvodna obrazovka
 
-            const tiles = Array.from(document.querySelectorAll(TILE_SELECTOR));
-            if (tiles.length === 0) return;
+            const panel = document.getElementById(PANEL_ID);
+            const content = panel && panel.querySelector('.sapMPanelContent');
+            if (!content) return;
 
-            const grid = commonAncestor(tiles);
-            if (!grid || !grid.parentElement) return;
+            const list = workcenterList();
+            if (!list.length) return;   // appka este taha data zo SAP (~25 s)
+
+            injectStyles();
+            document.body.classList.add(BODY_CLASS);
 
             let host = document.getElementById(OVERVIEW_ID);
-            if (!host || !host.parentElement) {
+            if (!host) {
                 host = document.createElement('div');
                 host.id = OVERVIEW_ID;
-            }
-            // host musi byt SUROdenec mriezky, inak by ho skrytie schovalo tiez
-            if (host.nextElementSibling !== grid || host.parentElement !== grid.parentElement) {
-                grid.parentElement.insertBefore(host, grid);
+                content.insertBefore(host, content.firstChild);
+            } else if (host.parentElement !== content) {
+                content.insertBefore(host, content.firstChild);
             }
 
-            // povodna mriezka sa skryje, ale zostava v DOM - klika sa cez nu
-            if (grid.style.display !== 'none') grid.style.display = 'none';
-
-            const entries = collectTiles();
-            const signature = entries.map((e) => e.name + ':' + e.code + ':' + e.online).join('|');
+            // prekreslit len ked sa nieco zmenilo (clovek, pocty, rozbalenie)
+            const signature = userName() + '#' +
+                list.map((w) => w.workcenter + ':' + (w.count || 0)).join('|') + '#' +
+                Array.from(expanded).join(',');
             if (signature === lastSignature) return;
             lastSignature = signature;
 
-            render(host, entries);
+            render(host, list);
         }
 
         DomWatch.add(ensureOverview);
+        // `count` sa meni bez zmeny DOM, preto aj casovac (rovnako ako Python verzia)
+        onReady(() => setInterval(ensureOverview, 1500));
     }
 
     /* --------------------- 3.9 Ladiaci vypis ---------------------------- */
@@ -2463,26 +2467,6 @@
             'Excel je nepovinný — ak chýba, výkres sa hľadá priamo podľa čísla materiálu.';
         body.appendChild(colNote);
 
-        // --- kategorie pracovisk pre uvodny prehlad ---
-        const hGroups = document.createElement('h3');
-        hGroups.textContent = 'Kategórie pracovísk (úvodná obrazovka)';
-        body.appendChild(hGroups);
-
-        const groupsTa = document.createElement('textarea');
-        groupsTa.rows = 5;
-        groupsTa.spellcheck = false;
-        groupsTa.value = draftGroups.value;
-        groupsTa.style.cssText = 'width:100%;box-sizing:border-box;padding:8px 10px;border:1px solid #ccd1d9;' +
-            'border-radius:6px;font:12px/1.5 ui-monospace,Consolas,monospace;resize:vertical;';
-        groupsTa.addEventListener('input', () => { draftGroups.value = groupsTa.value; });
-        body.appendChild(groupsTa);
-
-        const groupsNote = document.createElement('p');
-        groupsNote.className = 'pda-note';
-        groupsNote.textContent = 'Jedna kategória na riadok: Názov|Podtitul|VZOR,VZOR,… ' +
-            'Pracovisko padne do prvej kategórie, ktorej vzor sa nachádza v jeho čísle alebo názve ' +
-            '(bez ohľadu na diakritiku a veľkosť písmen). Čo sa nikam nehodí, skončí v „Ostatné" — nič sa nestratí.';
-        body.appendChild(groupsNote);
 
         // --- paticka ---
         const foot = document.createElement('div');
